@@ -4,6 +4,13 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ## Unreleased
 
+### Added
+
+- `godo init [-p path]` creates an empty `godo.toml`.
+- `godo register -n name [-p path]` adds or updates a target, and `godo unregister -n name` removes one. Paths are relative to where you run the command and are stored relative to the project root. Edits keep `godo.toml`'s comments and layout.
+- `godo scaff -n name [-p path]` creates a directory with a starter Makefile and registers it. It never overwrites an existing Makefile, unlike the C++ godo.
+- `godo migrate` writes `godo.toml` from the C++ godo's `.godo/config` and keeps the old file. Projects still on `.godo/config` are asked to migrate before `register`, `unregister`, or `scaff` change anything.
+
 ## 0.1.0 - 2026-11-04
 
 ### Added

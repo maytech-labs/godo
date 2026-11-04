@@ -3,10 +3,12 @@
 //! godo: make, but every run is a detachable, logged, watchable job.
 //!
 //! The command tree matches the C++ godo. Working so far: running a
-//! directive in a target (`godo build web`), `list`, and `version`. The
-//! rest say they aren't ported yet.
+//! directive in a target (`godo build web`), the registry commands (`init`,
+//! `list`, `register`, `unregister`, `scaff`, `migrate`), and `version`. The
+//! daemon commands say they aren't ported yet.
 
 mod config;
+mod registry;
 mod targets;
 
 use std::ffi::OsString;
@@ -89,6 +91,8 @@ enum Godo {
     Register(Register),
     /// Unregister existing build target.
     Unregister(Unregister),
+    /// Convert the C++ godo's .godo/config to godo.toml.
+    Migrate(Migrate),
     /// List running processes in the daemon.
     Ps(Ps),
     /// Stop the godo daemon.
@@ -123,6 +127,38 @@ impl Handler<Ctx> for List {
     }
 }
 
+impl Handler<Ctx> for Init {
+    fn run(self, _: &mut Ctx) -> clapsmith::Result {
+        registry::init(&std::env::current_dir()?, self.path.as_deref())
+    }
+}
+
+impl Handler<Ctx> for Register {
+    fn run(self, ctx: &mut Ctx) -> clapsmith::Result {
+        let cwd = std::env::current_dir()?;
+        registry::register(ctx.config()?, &cwd, &self.name, self.path.as_deref())
+    }
+}
+
+impl Handler<Ctx> for Unregister {
+    fn run(self, ctx: &mut Ctx) -> clapsmith::Result {
+        registry::unregister(ctx.config()?, &self.name)
+    }
+}
+
+impl Handler<Ctx> for Scaff {
+    fn run(self, ctx: &mut Ctx) -> clapsmith::Result {
+        let cwd = std::env::current_dir()?;
+        registry::scaff(ctx.config()?, &cwd, &self.name, self.path.as_deref())
+    }
+}
+
+impl Handler<Ctx> for Migrate {
+    fn run(self, _: &mut Ctx) -> clapsmith::Result {
+        registry::migrate(&std::env::current_dir()?)
+    }
+}
+
 /// Flags every command accepts.
 #[derive(Args)]
 struct Global {
@@ -133,7 +169,7 @@ struct Global {
 
 #[derive(Args)]
 struct Init {
-    /// the path to initialize godo in
+    /// the directory to initialize godo in [default: here]
     #[arg(short, long)]
     path: Option<String>,
 }
@@ -150,7 +186,7 @@ struct Scaff {
     /// the name of the target
     #[arg(short, long)]
     name: String,
-    /// the path to the target
+    /// the directory to create [default: ./<name>]
     #[arg(short, long)]
     path: Option<String>,
 }
@@ -160,7 +196,7 @@ struct Register {
     /// the name of the target
     #[arg(short, long)]
     name: String,
-    /// the path to the target
+    /// the target's directory [default: here]
     #[arg(short, long)]
     path: Option<String>,
 }
@@ -171,6 +207,9 @@ struct Unregister {
     #[arg(short, long)]
     name: String,
 }
+
+#[derive(Args)]
+struct Migrate;
 
 #[derive(Args)]
 struct Ps;
@@ -233,8 +272,7 @@ macro_rules! not_ported {
 }
 
 not_ported! {
-    Init => "init", Scaff => "scaff", Register => "register",
-    Unregister => "unregister", Ps => "ps", Stop => "stop", Restart => "restart",
+    Ps => "ps", Stop => "stop", Restart => "restart",
     Run => "run", Watch => "watch", History => "history", Attach => "attach",
 }
 

@@ -56,7 +56,7 @@ pub fn run(config: &Config, words: &[OsString], verbose: bool) -> clapsmith::Res
     Ok(exit_code(status))
 }
 
-fn unknown_target(config: &Config, name: &str) -> String {
+pub(crate) fn unknown_target(config: &Config, name: &str) -> String {
     let mut message = format!("no target named `{name}`");
     let close: Vec<&str> = config
         .targets
