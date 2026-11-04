@@ -18,6 +18,7 @@ default = ["derive"]
 derive = ["dep:clapsmith-derive"]
 
 [dependencies]
+anstream = "1.0.0"
 clap.workspace = true
 clapsmith-derive = { workspace = true, optional = true }
 

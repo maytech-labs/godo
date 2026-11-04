@@ -33,12 +33,13 @@ fn main() -> ExitCode {
 
 - **Typed dispatch.** `#[derive(Dispatch)]` sends each subcommand to its `Handler`. A subcommand without a handler is a compile error, not a forgotten `match` arm.
 - **A context, not globals.** Handlers get `&mut Ctx`: config, clients, an output buffer in tests.
+- **Colourful help out of the box.** clapsmith draws each help screen itself: blue title, cyan headings, magenta flags, green commands, dim placeholders, and `[required]` / `[default: x]` notes. clap's usage errors use the same palette. Colours are dropped when output isn't a terminal. Pick your own with `Theme`, or `Theme::plain()`.
 - **Outcomes, not `exit()`.** `dispatch_from` returns `Outcome::{Ran, Help, Usage, Failed}` without printing, so tests can assert on it. `main` prints it and returns the exit code.
 
 ## Planned
 
 - **Interactive mode.** A menu when no subcommand is given. Typed prompts for missing values (select for enums, confirm for bools, masked for secrets). Off when not on a terminal. Prints the equivalent command afterwards so you learn the CLI.
-- **Styled output.** One palette for help, errors, prompts, and your program's own output.
+- **Styled output beyond help.** The same `Theme` for prompts and your program's own output.
 - **More from the command tree.** Completions, man pages, MCP tool definitions.
 
 ## Working on clapsmith

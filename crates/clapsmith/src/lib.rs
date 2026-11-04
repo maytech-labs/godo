@@ -35,8 +35,13 @@
 //! assert_eq!(out, ["hello, godo"]);
 //! ```
 //!
-//! Interactive mode and styled output are planned; see the README.
+//! Help screens are drawn by clapsmith in the colours of a [`Theme`], and
+//! clap's usage errors use the same palette. Colours are dropped when the
+//! output isn't a terminal. Interactive mode is planned; see the README.
 
+pub mod help;
+
+pub use help::Theme;
 use std::ffi::OsString;
 use std::process::ExitCode;
 
@@ -71,14 +76,29 @@ pub enum Outcome {
     Failed(Error),
 }
 
-/// Parses `args` (including the program name) and runs the command.
+/// Parses `args` (including the program name) and runs the command, with
+/// the default [`Theme`].
 pub fn dispatch_from<C, Ctx, I, T>(args: I, ctx: &mut Ctx) -> Outcome
 where
     C: Parser + Handler<Ctx>,
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    match C::try_parse_from(args) {
+    dispatch_themed::<C, Ctx, I, T>(args, ctx, &Theme::default())
+}
+
+/// [`dispatch_from`] with a chosen [`Theme`].
+pub fn dispatch_themed<C, Ctx, I, T>(args: I, ctx: &mut Ctx, theme: &Theme) -> Outcome
+where
+    C: Parser + Handler<Ctx>,
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let mut cmd = help::apply(C::command(), theme);
+    let parsed = cmd
+        .try_get_matches_from_mut(args)
+        .and_then(|matches| C::from_arg_matches(&matches).map_err(|e| e.format(&mut cmd)));
+    match parsed {
         Ok(command) => match command.run(ctx) {
             Ok(code) => Outcome::Ran(code),
             Err(error) => Outcome::Failed(error),
@@ -110,7 +130,8 @@ pub fn report(outcome: Outcome) -> ExitCode {
             ExitCode::from(u8::try_from(error.exit_code()).unwrap_or(2))
         }
         Outcome::Failed(error) => {
-            eprintln!("error: {error}");
+            let style = Theme::default().error;
+            anstream::eprintln!("{style}error:{style:#} {error}");
             ExitCode::FAILURE
         }
     }
