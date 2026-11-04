@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: LicenseRef-REAL-1.0
+#
+# godo's registry: `godo <directive> <target>` runs `make <directive>` in
+# the target's directory. Try `godo list` and `godo list -n godo`.
+
+[targets]
+godo = "."
+clapsmith = "crates/clapsmith"

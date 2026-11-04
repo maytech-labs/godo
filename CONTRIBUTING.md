@@ -9,6 +9,10 @@
 
 clapsmith never depends on godo, so it builds and tests on its own.
 
+## godo builds itself
+
+This repo is a godo project (`godo.toml`). With godo installed: `godo list -n godo`, `godo build godo`, `godo check godo`, `godo test clapsmith`. Plain cargo works the same.
+
 ## Before opening a PR
 
 ```sh

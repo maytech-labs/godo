@@ -8,7 +8,7 @@ Source-available under the [Reciprocal Ethical AI License (REAL) 1.0](https://gi
 cargo install godo-cli    # installs the `godo` binary
 ```
 
-**Status:** 0.0.1 holds the name and prints its version. godo is being ported to Rust from a C++ tool. Planned, in order:
+**Status:** early. `godo <directive> <target>` (e.g. `godo build web`) and `godo list` work, in the foreground, reading the C++ godo's `.godo/config`. godo is being ported to Rust from a C++ tool. Planned, in order:
 
 1. **Targets.** Register named Makefile directories and run `godo <directive> <target>` from anywhere in the repo. `godo list` shows each Makefile's `## documented` targets.
 2. **Jobs.** Every run goes to a per-user daemon in a PTY. Ctrl+C detaches, `godo attach` reattaches, and logs and history are kept.
