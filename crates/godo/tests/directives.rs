@@ -90,6 +90,7 @@ fn runs_the_directive_in_the_target_from_a_subdirectory() {
     assert!(out.status.success(), "{}", stderr(&out));
     let text = stdout(&out);
     assert!(text.contains("dev in web"), "{text}");
+    assert!(!text.contains("Entering directory"), "{text}");
     assert!(
         text.contains(&format!("root={}", p.root.display())),
         "GODO_ROOT should be the project root: {text}"

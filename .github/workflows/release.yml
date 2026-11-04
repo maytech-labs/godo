@@ -143,8 +143,15 @@ jobs:
           mkdir "$dir/app"
           printf '[targets]\napp = "app"\n' > "$dir/godo.toml"
           printf 'hello: ## Say hello\n\t@echo hello from godo\n' > "$dir/app/Makefile"
-          (cd "$dir" && "$OLDPWD/$bin" list -n app | grep -q "Say hello")
-          (cd "$dir" && "$OLDPWD/$bin" hello app | grep -q "hello from godo")
+          bin="$PWD/$bin"
+          # Capture, then match: `grep -q` closing the pipe early would
+          # kill the writer with SIGPIPE.
+          list=$(cd "$dir" && "$bin" list -n app)
+          echo "$list"
+          grep "Say hello" <<< "$list"
+          out=$(cd "$dir" && "$bin" hello app)
+          echo "$out"
+          [ "$out" = "hello from godo" ] || { echo "unexpected output from make"; exit 1; }
       - name: Package
         shell: bash
         env:

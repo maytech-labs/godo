@@ -30,14 +30,16 @@ pub fn run(config: &Config, words: &[OsString], verbose: bool) -> clapsmith::Res
     };
     let dir = config.dir(target);
     let mut make = Command::new("make");
-    make.arg("-C")
+    // GNU make announces "Entering directory" for -C; that's noise here.
+    make.arg("--no-print-directory")
+        .arg("-C")
         .arg(&dir)
         .arg(directive)
         .args(extra)
         .env("GODO_ROOT", &config.root);
     if verbose {
         eprintln!(
-            "godo: make -C {} {}{} (GODO_ROOT={}, from {})",
+            "godo: make --no-print-directory -C {} {}{} (GODO_ROOT={}, from {})",
             dir.display(),
             directive.to_string_lossy(),
             extra
