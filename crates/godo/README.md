@@ -5,7 +5,9 @@ make, but every run is a detachable, logged, watchable job.
 Source-available under the [Reciprocal Ethical AI License (REAL) 1.0](https://github.com/maytech-labs/godo/blob/main/LICENSE.md).
 
 ```sh
-cargo install godo-cli    # installs the `godo` binary
+brew install maytech-labs/tap/godo           # after the first release
+brew install --HEAD maytech-labs/tap/godo    # until then: builds main
+cargo install --git https://github.com/maytech-labs/godo godo-cli
 ```
 
 **Status:** early. `godo <directive> <target>` (e.g. `godo build web`) and `godo list` work, in the foreground, reading the C++ godo's `.godo/config`. godo is being ported to Rust from a C++ tool. Planned, in order:
