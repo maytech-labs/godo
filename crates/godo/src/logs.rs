@@ -120,25 +120,22 @@ impl Tailer {
 mod tests {
     use super::*;
 
-    fn temp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("godo-logs-{}-{name}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join("1.log")
-    }
+    use crate::testdir::TestDir;
 
     #[test]
     fn written_chunks_read_back_with_stderr_marked() {
-        let path = temp("roundtrip");
+        let dir = TestDir::new("logs-roundtrip");
+        let path = dir.path().join("1.log");
         let mut w = LogWriter::open(&path).unwrap();
         w.write("out", "hello\n").unwrap();
         w.write("err", "oops\n").unwrap();
         assert_eq!(read(&path), "hello\n\x1b[31merr:\x1b[0moops\n");
-        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
     fn tailer_returns_only_new_complete_lines() {
-        let path = temp("tail");
+        let dir = TestDir::new("logs-tail");
+        let path = dir.path().join("1.log");
         let mut w = LogWriter::open(&path).unwrap();
         w.write("out", "one ").unwrap();
         let mut t = Tailer::default();
@@ -161,6 +158,5 @@ mod tests {
             .write_all(b",\"d\":\"!\"}\n")
             .unwrap();
         assert_eq!(t.read_new(&paths), "!");
-        std::fs::remove_file(&path).unwrap();
     }
 }

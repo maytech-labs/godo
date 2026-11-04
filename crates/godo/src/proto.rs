@@ -10,8 +10,14 @@
 //! and `~/.godo`, so both can run side by side.
 //!
 //! Messages are JSON, each prefixed with its length as a big-endian u32.
-//! Every connection starts with an [`Envelope`] naming the client's version;
-//! a daemon of another version answers with an error instead of guessing.
+//! Every connection starts with an [`Envelope`] naming the client's version.
+//! A daemon of another version answers [`Event::VersionMismatch`] instead of
+//! guessing, except to `shutdown`, which every version honours so a newer
+//! godo can always replace an older daemon.
+//!
+//! **Stable across versions** (never change these): the frame format, the
+//! envelope's `protocol` and `version` fields, `{"type": "shutdown",
+//! "force": bool}`, and the `version_mismatch`, `busy`, and `ok` events.
 
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -20,6 +26,16 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped when messages change incompatibly.
 pub const PROTOCOL: u32 = 1;
+/// This build's version, with the commit for unreleased builds (build.rs).
+/// Client and daemon must match exactly.
+pub const VERSION: &str = env!("GODO_VERSION");
+
+/// The version client and daemon compare: [`VERSION`], unless
+/// `GODO_VERSION_OVERRIDE` is set. That's a testing hook, for playing an
+/// older godo; `--version` always says [`VERSION`].
+pub fn wire_version() -> String {
+    std::env::var("GODO_VERSION_OVERRIDE").unwrap_or_else(|_| VERSION.to_string())
+}
 /// The largest message accepted, so a bad length can't exhaust memory.
 const MAX_MESSAGE: u32 = 64 << 20;
 
@@ -97,10 +113,19 @@ impl Envelope {
     pub fn new(request: Request) -> Self {
         Self {
             protocol: PROTOCOL,
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: wire_version(),
             request,
         }
     }
+}
+
+/// An envelope read before its request is understood, so a daemon can tell
+/// a client of another version apart from a malformed message.
+#[derive(Deserialize, Debug)]
+pub struct RawEnvelope {
+    pub protocol: u32,
+    pub version: String,
+    pub request: serde_json::Value,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -128,25 +153,44 @@ pub enum Request {
     Kill {
         id: u64,
     },
-    /// Stream output of every job for `directive target`, as it happens.
-    Subscribe {
-        target: String,
-        directive: String,
+    /// Stop the daemon. Without `force`, only when no jobs are running.
+    Shutdown {
+        force: bool,
     },
-    Shutdown,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
-    Started { id: u64 },
-    Attached { id: u64 },
-    Subscribed,
-    Log { stream: String, data: String },
-    Exit { code: i32 },
-    Processes { processes: Vec<ProcessInfo> },
+    Started {
+        id: u64,
+    },
+    Attached {
+        id: u64,
+    },
+    Log {
+        stream: String,
+        data: String,
+    },
+    Exit {
+        code: i32,
+    },
+    Processes {
+        processes: Vec<ProcessInfo>,
+    },
     Ok,
-    Error { message: String },
+    Error {
+        message: String,
+    },
+    /// The daemon is another version; `running` is how many jobs it has.
+    VersionMismatch {
+        daemon_version: String,
+        running: usize,
+    },
+    /// Refused to shut down: these jobs are still running.
+    Busy {
+        running: Vec<ProcessInfo>,
+    },
 }
 
 /// A job, as `ps`, `history`, and `watch` see it.

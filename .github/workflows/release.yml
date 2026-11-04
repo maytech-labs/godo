@@ -116,6 +116,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.prepare.outputs.sha }}
+          # Tags, so the binary knows it's the release (see crates/godo/build.rs).
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: "1.98.1"
@@ -136,9 +138,15 @@ jobs:
       - name: Smoke test
         if: ${{ !matrix.cross }}
         shell: bash
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           bin=target/${{ matrix.target }}/release/godo
           "$bin" --version
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            want="godo ${TAG#godo-v}"
+            [ "$("$bin" --version)" = "$want" ] || { echo "a release must say exactly: $want"; exit 1; }
+          fi
           dir=$(mktemp -d)
           mkdir "$dir/app"
           printf '[targets]\napp = "app"\n' > "$dir/godo.toml"

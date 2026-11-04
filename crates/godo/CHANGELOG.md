@@ -17,6 +17,12 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 - The daemon lives in a private directory (`$GODO_HOME`, else `$XDG_STATE_HOME/godo`, else `~/.local/state/godo`), not a shared `/tmp/godo.sock` that any local user could connect to. It doesn't clash with a running C++ godo.
 - A client and daemon of different versions say so instead of misreading each other.
 - Writing to a closed stdout (`godo build web | head`) no longer crashes godo.
+- `godo attach` replays a running job's whole output from its log, not only the last megabyte, and the daemon sends each chunk to the log and clients together, so nothing is missed or doubled.
+- `godo stop` and `godo restart` refuse while jobs are running and list them; `--force` stops them too.
+- A newer godo replaces an idle daemon of another version by itself. One with running jobs is left alone, with a message saying `godo restart --force`.
+- The daemon keeps the newest 500 finished jobs and their logs (`GODO_HISTORY_LIMIT` to change), and trims its own log.
+- Builds that aren't a release say so: `godo --version` gives `<version>+<commits>.g<sha>`.
+- Target names with wide characters no longer misalign `watch`'s selection.
 
 ## 0.1.1 - 2026-11-04
 

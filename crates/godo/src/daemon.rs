@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: LicenseRef-REAL-1.0
 
-//! The godo daemon: runs jobs in pseudo-terminals, keeps their output in
-//! memory and in `logs/<id>.log`, and streams it to clients that run,
-//! attach to, or watch them.
+//! The godo daemon: runs jobs in pseudo-terminals, writes their output to
+//! `logs/<id>.log`, and streams it to clients that run or attach to them.
 //!
 //! Unlike the C++ daemon, every job runs with the working directory,
 //! environment, and terminal size of the client that started it (not the
 //! daemon's), and killing a job signals its whole process group.
+//!
+//! A job's output is written to its log and sent to its clients under one
+//! lock, and attaching reads the log and joins the clients under the same
+//! lock, so an attached client sees everything exactly once.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::io::{self, Read};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -17,39 +20,43 @@ use std::time::Duration;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 use crate::logs::LogWriter;
-use crate::proto::{self, Envelope, Event, Home, PROTOCOL, ProcessInfo, Request};
+use crate::proto::{self, Event, Home, PROTOCOL, ProcessInfo, RawEnvelope, Request};
 
-/// Output kept in memory per job, for attaching; the rest is on disk.
-const BUFFER_LIMIT: usize = 1 << 20;
 /// How long a client may stall a write before it's dropped.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Time between SIGTERM and SIGKILL when killing a job.
 const KILL_GRACE: Duration = Duration::from_secs(3);
+/// Finished jobs kept, with their logs, unless `GODO_HISTORY_LIMIT` says.
+const HISTORY_LIMIT: usize = 500;
+/// The daemon's own log is cut back to [`DAEMON_LOG_KEEP`] past this.
+const DAEMON_LOG_LIMIT: u64 = 1 << 20;
+const DAEMON_LOG_KEEP: usize = 256 << 10;
 
 /// The id the daemon itself has in `ps` and `watch`.
 const DAEMON_ID: u64 = 0;
 
 struct Job {
     info: ProcessInfo,
-    /// Recent output, at most [`BUFFER_LIMIT`] bytes.
-    buffer: String,
     /// Clients that ran or attached to this job.
     clients: Vec<UnixStream>,
+    /// The job's log, open while it runs.
+    log: Option<LogWriter>,
     /// Kept for the job's lifetime; closing it hangs up the terminal.
     master: Option<Box<dyn portable_pty::MasterPty + Send>>,
 }
 
 struct State {
     next_id: u64,
-    /// Every job since history was last cleared, by id.
+    /// Jobs still running and the newest finished ones, by id.
     jobs: BTreeMap<u64, Job>,
-    /// Clients of `watch`, by `"<directive> <target>"`.
-    subscribers: HashMap<String, Vec<UnixStream>>,
     daemon: ProcessInfo,
 }
 
 struct Daemon {
     home: Home,
+    /// What this daemon answers to; clients of another version are told.
+    version: String,
+    history_limit: usize,
     state: Mutex<State>,
 }
 
@@ -77,13 +84,18 @@ fn listen(home: Home) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
     }
+    trim_log(&home.log(DAEMON_ID), DAEMON_LOG_LIMIT, DAEMON_LOG_KEEP);
+    let history_limit = std::env::var("GODO_HISTORY_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(HISTORY_LIMIT);
+    let version = proto::wire_version();
     let jobs = load_history(&home);
     let next_id = jobs.keys().next_back().map_or(1, |id| id + 1);
     let daemon = Arc::new(Daemon {
         state: Mutex::new(State {
             next_id,
             jobs,
-            subscribers: HashMap::new(),
             daemon: ProcessInfo {
                 id: DAEMON_ID,
                 pid: std::process::id(),
@@ -97,8 +109,19 @@ fn listen(home: Home) -> io::Result<()> {
             },
         }),
         home,
+        version,
+        history_limit,
     });
-    daemon.log(&format!("daemon started; socket={}", socket.display()));
+    {
+        let mut state = daemon.lock();
+        daemon.prune(&mut state);
+        daemon.save_history(&state);
+    }
+    daemon.log(&format!(
+        "daemon {} started; socket={}",
+        daemon.version,
+        socket.display()
+    ));
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let daemon = Arc::clone(&daemon);
@@ -122,20 +145,35 @@ impl Daemon {
 
     fn serve(self: Arc<Self>, mut stream: UnixStream) {
         let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
-        let envelope = match proto::read::<Envelope>(&mut stream) {
-            Ok(Some(envelope)) => envelope,
+        let raw = match proto::read::<RawEnvelope>(&mut stream) {
+            Ok(Some(raw)) => raw,
             _ => return,
         };
-        let ours = env!("CARGO_PKG_VERSION");
-        if envelope.protocol != PROTOCOL || envelope.version != ours {
-            let message = format!(
-                "the godo daemon is version {ours} but this godo is {}; run `godo restart`",
-                envelope.version
-            );
-            let _ = proto::write(&mut stream, &Event::Error { message });
+        let same = raw.protocol == PROTOCOL && raw.version == self.version;
+        let request = if same {
+            match serde_json::from_value::<Request>(raw.request) {
+                Ok(request) => request,
+                Err(e) => {
+                    let message = format!("the godo daemon can't read this request: {e}");
+                    let _ = proto::write(&mut stream, &Event::Error { message });
+                    return;
+                }
+            }
+        } else if raw.request.get("type").and_then(|t| t.as_str()) == Some("shutdown") {
+            // Every version honours shutdown, so a newer godo can always
+            // replace this daemon.
+            let force = raw.request.get("force").and_then(|f| f.as_bool()) == Some(true);
+            Request::Shutdown { force }
+        } else {
+            let running = self.running().len();
+            let reply = Event::VersionMismatch {
+                daemon_version: self.version.clone(),
+                running,
+            };
+            let _ = proto::write(&mut stream, &reply);
             return;
-        }
-        let reply = match envelope.request {
+        };
+        let reply = match request {
             Request::Run {
                 argv,
                 cwd,
@@ -154,22 +192,12 @@ impl Daemon {
                     cols,
                     rows,
                 };
-                match self.start(spec, stream) {
-                    Ok(()) => return,
-                    Err((mut stream, message)) => {
-                        let _ = proto::write(&mut stream, &Event::Error { message });
-                        return;
-                    }
-                }
-            }
-            Request::Attach { id } => return self.attach(id, stream),
-            Request::Subscribe { target, directive } => {
-                if proto::write(&mut stream, &Event::Subscribed).is_ok() {
-                    let key = format!("{directive} {target}");
-                    self.lock().subscribers.entry(key).or_default().push(stream);
+                if let Err((mut stream, message)) = self.start(spec, stream) {
+                    let _ = proto::write(&mut stream, &Event::Error { message });
                 }
                 return;
             }
+            Request::Attach { id } => return self.attach(id, stream),
             Request::Ps | Request::History => {
                 let state = self.lock();
                 let mut processes = vec![state.daemon.clone()];
@@ -186,13 +214,34 @@ impl Daemon {
                     message: format!("no running process with ID {id}"),
                 },
             },
-            Request::Shutdown => {
-                self.log("shutdown requested");
-                let _ = proto::write(&mut stream, &Event::Ok);
-                self.shutdown();
+            Request::Shutdown { force } => {
+                let running = self.running();
+                if !running.is_empty() && !force {
+                    Event::Busy { running }
+                } else {
+                    self.log(&format!(
+                        "shutdown requested{}",
+                        if running.is_empty() {
+                            ""
+                        } else {
+                            "; stopping running jobs"
+                        }
+                    ));
+                    let _ = proto::write(&mut stream, &Event::Ok);
+                    self.shutdown();
+                }
             }
         };
         let _ = proto::write(&mut stream, &reply);
+    }
+
+    fn running(&self) -> Vec<ProcessInfo> {
+        self.lock()
+            .jobs
+            .values()
+            .filter(|j| j.info.running)
+            .map(|j| j.info.clone())
+            .collect()
     }
 
     fn start(self: &Arc<Self>, spec: Spec, stream: UnixStream) -> Result<(), (UnixStream, String)> {
@@ -227,19 +276,22 @@ impl Daemon {
 
         let mut state = self.lock();
         let id = state.next_id;
+        let log = match LogWriter::open(&self.home.log(id)) {
+            Ok(log) => log,
+            Err(e) => return Err((stream, format!("can't open the job's log: {e}"))),
+        };
         let mut child = match pair.slave.spawn_command(cmd) {
             Ok(child) => child,
-            Err(e) => {
-                drop(state);
-                return Err((stream, format!("can't start {program}: {e}")));
-            }
+            Err(e) => return Err((stream, format!("can't start {program}: {e}"))),
         };
         // The job has its own copy; ours would keep the terminal open.
         drop(pair.slave);
         state.next_id += 1;
         let mut stream = stream;
-        if proto::write(&mut stream, &Event::Started { id }).is_err() {
-            // The client left already; the job still runs, like a detach.
+        // If the client left already, the job still runs, as if detached.
+        let mut clients = Vec::new();
+        if proto::write(&mut stream, &Event::Started { id }).is_ok() {
+            clients.push(stream);
         }
         let info = ProcessInfo {
             id,
@@ -256,8 +308,8 @@ impl Daemon {
             id,
             Job {
                 info,
-                buffer: String::new(),
-                clients: vec![stream],
+                clients,
+                log: Some(log),
                 master: Some(pair.master),
             },
         );
@@ -286,9 +338,8 @@ impl Daemon {
         Ok(())
     }
 
-    /// Copies a job's output to its log, its buffer, and its clients.
+    /// Copies a job's output to its log and its clients.
     fn pump(&self, id: u64, mut reader: Box<dyn Read + Send>) {
-        let mut writer = LogWriter::open(&self.home.log(id)).ok();
         let mut chunker = proto::Utf8Chunker::default();
         let mut buf = [0u8; 4096];
         loop {
@@ -300,31 +351,22 @@ impl Daemon {
             if text.is_empty() {
                 continue;
             }
-            if let Some(w) = writer.as_mut() {
-                let _ = w.write("out", &text);
+            let mut state = self.lock();
+            let Some(job) = state.jobs.get_mut(&id) else {
+                continue;
+            };
+            if let Some(log) = job.log.as_mut() {
+                let _ = log.write("out", &text);
             }
             let event = Event::Log {
                 stream: "out".into(),
-                data: text.clone(),
+                data: text,
             };
-            let mut state = self.lock();
-            let key = match state.jobs.get_mut(&id) {
-                Some(job) => {
-                    job.buffer.push_str(&text);
-                    trim_front(&mut job.buffer, BUFFER_LIMIT);
-                    broadcast(&mut job.clients, &event);
-                    job.info.key()
-                }
-                None => continue,
-            };
-            if let Some(subs) = state.subscribers.get_mut(&key) {
-                broadcast(subs, &event);
-            }
+            broadcast(&mut job.clients, &event);
         }
     }
 
     fn finish(&self, id: u64, code: i32) {
-        let event = Event::Exit { code };
         let mut state = self.lock();
         let Some(job) = state.jobs.get_mut(&id) else {
             return;
@@ -333,12 +375,10 @@ impl Daemon {
         job.info.exit_code = Some(code);
         job.info.end_ms = Some(proto::now_ms());
         job.master = None;
-        broadcast(&mut job.clients, &event);
+        job.log = None;
+        broadcast(&mut job.clients, &Event::Exit { code });
         job.clients.clear();
-        let key = job.info.key();
-        if let Some(subs) = state.subscribers.get_mut(&key) {
-            broadcast(subs, &event);
-        }
+        self.prune(&mut state);
         self.save_history(&state);
     }
 
@@ -350,11 +390,9 @@ impl Daemon {
             let _ = proto::write(&mut stream, &Event::Error { message });
             return;
         };
-        let backlog = if job.info.running {
-            job.buffer.clone()
-        } else {
-            crate::logs::read(&self.home.log(id))
-        };
+        // Under the lock, the log is everything sent so far: nothing is
+        // missed between reading it and joining the clients.
+        let backlog = crate::logs::read(&self.home.log(id));
         let ok = proto::write(&mut stream, &Event::Attached { id }).is_ok()
             && (backlog.is_empty()
                 || proto::write(
@@ -398,6 +436,21 @@ impl Daemon {
         true
     }
 
+    /// Drops the oldest finished jobs, and their logs, past the limit.
+    fn prune(&self, state: &mut State) {
+        let finished: Vec<u64> = state
+            .jobs
+            .iter()
+            .filter(|(_, j)| !j.info.running)
+            .map(|(id, _)| *id)
+            .collect();
+        let excess = finished.len().saturating_sub(self.history_limit);
+        for id in &finished[..excess] {
+            state.jobs.remove(id);
+            let _ = std::fs::remove_file(self.home.log(*id));
+        }
+    }
+
     fn clear_history(&self) {
         let mut state = self.lock();
         let finished: Vec<u64> = state
@@ -416,13 +469,20 @@ impl Daemon {
         self.log("history cleared");
     }
 
+    /// Stops running jobs, gives them a moment to end, and exits.
     fn shutdown(&self) -> ! {
-        let state = self.lock();
-        for job in state.jobs.values().filter(|j| j.info.running) {
-            signal_group(job.info.pid, libc::SIGTERM);
+        let pids: Vec<u32> = self.running().iter().map(|p| p.pid).collect();
+        for pid in &pids {
+            signal_group(*pid, libc::SIGTERM);
+        }
+        let deadline = std::time::Instant::now() + KILL_GRACE;
+        while !self.running().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        for job in self.running() {
+            signal_group(job.pid, libc::SIGKILL);
         }
         let _ = std::fs::remove_file(self.home.socket());
-        drop(state);
         self.log("daemon stopped");
         std::process::exit(0);
     }
@@ -465,13 +525,36 @@ fn load_history(home: &Home) -> BTreeMap<u64, Job> {
             }
             let job = Job {
                 info,
-                buffer: String::new(),
                 clients: Vec::new(),
+                log: None,
                 master: None,
             };
             (job.info.id, job)
         })
         .collect()
+}
+
+/// Cuts a log back to about its last `keep` bytes once it passes `limit`,
+/// at a line boundary so every remaining line is whole.
+fn trim_log(path: &std::path::Path, limit: u64, keep: usize) {
+    let Ok(len) = std::fs::metadata(path).map(|m| m.len()) else {
+        return;
+    };
+    if len <= limit {
+        return;
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return;
+    };
+    let from = bytes.len().saturating_sub(keep);
+    let start = bytes[from..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(bytes.len(), |i| from + i + 1);
+    let tmp = path.with_extension("log.tmp");
+    if std::fs::write(&tmp, &bytes[start..]).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
 }
 
 /// Sends `event` to every client, dropping the ones that are gone.
@@ -484,22 +567,13 @@ fn normalize_newlines(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-/// Keeps the last `limit` bytes, cut at a character boundary.
-fn trim_front(text: &mut String, limit: usize) {
-    if text.len() <= limit {
-        return;
-    }
-    let mut cut = text.len() - limit;
-    while !text.is_char_boundary(cut) {
-        cut += 1;
-    }
-    text.drain(..cut);
-}
-
 fn signal_group(pid: u32, signal: libc::c_int) {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return;
     };
+    if pid <= 0 {
+        return;
+    }
     // SAFETY: kill() only sends a signal. Jobs lead their own session (the
     // terminal setup calls setsid), so -pid is the job's process group.
     unsafe {
@@ -509,7 +583,17 @@ fn signal_group(pid: u32, signal: libc::c_int) {
     }
 }
 
+/// The signal number from a description like `Terminated: 15` (macOS) or
+/// `Terminated` (Linux).
 fn signal_number(name: Option<&str>) -> i32 {
+    let name = name.unwrap_or_default();
+    if let Some(n) = name
+        .rsplit(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|d| d.parse().ok())
+    {
+        return n;
+    }
     let signals = [
         ("Hangup", libc::SIGHUP),
         ("Interrupt", libc::SIGINT),
@@ -518,7 +602,6 @@ fn signal_number(name: Option<&str>) -> i32 {
         ("Broken pipe", libc::SIGPIPE),
         ("Abort", libc::SIGABRT),
     ];
-    let name = name.unwrap_or_default();
     signals
         .iter()
         .find(|(n, _)| name.contains(n))
@@ -535,13 +618,31 @@ mod tests {
     }
 
     #[test]
-    fn buffer_keeps_the_end_at_a_char_boundary() {
-        // ● is 3 bytes: cutting 3 bytes from the front would split it.
-        let mut s = "ab●cd".to_string();
-        trim_front(&mut s, 4);
-        assert_eq!(s, "cd");
-        let mut s = "abcdef".to_string();
-        trim_front(&mut s, 3);
-        assert_eq!(s, "def");
+    fn signal_numbers_from_either_platforms_wording() {
+        assert_eq!(signal_number(Some("Terminated: 15")), 15);
+        assert_eq!(signal_number(Some("Killed: 9")), 9);
+        assert_eq!(signal_number(Some("Hangup")), libc::SIGHUP);
+        assert_eq!(signal_number(Some("Killed")), libc::SIGKILL);
+    }
+
+    #[test]
+    fn trimming_a_log_keeps_whole_lines_from_the_end() {
+        let dir = crate::testdir::TestDir::new("trim");
+        let path = dir.path().join("0.log");
+        let lines: String = (0..100).map(|i| format!("line {i:03}\n")).collect();
+        std::fs::write(&path, &lines).unwrap();
+        trim_log(&path, 10_000, 50);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            lines,
+            "under the limit"
+        );
+        trim_log(&path, 100, 50);
+        let kept = std::fs::read_to_string(&path).unwrap();
+        assert!(kept.len() <= 50 && kept.ends_with("line 099\n"), "{kept:?}");
+        assert!(
+            kept.starts_with("line "),
+            "starts on a whole line: {kept:?}"
+        );
     }
 }

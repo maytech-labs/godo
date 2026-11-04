@@ -336,7 +336,8 @@ impl<S: Source> Watcher<S> {
         };
         let dot = Span::styled(dot, Style::new().fg(colour));
         if key == self.selected {
-            let used = 2 + 3 + key.chars().count();
+            // Columns, not characters: wide characters take two.
+            let used = 2 + 3 + unicode_width::UnicodeWidthStr::width(key);
             let pad = " ".repeat(width.saturating_sub(used));
             Line::from(vec![
                 Span::raw("> "),
@@ -654,7 +655,7 @@ mod tests {
 
     struct Fake {
         processes: Vec<ProcessInfo>,
-        dir: PathBuf,
+        dir: crate::testdir::TestDir,
     }
 
     impl Source for Fake {
@@ -662,7 +663,7 @@ mod tests {
             Some(self.processes.clone())
         }
         fn log_path(&self, id: u64) -> PathBuf {
-            self.dir.join(format!("{id}.log"))
+            self.dir.path().join(format!("{id}.log"))
         }
     }
 
@@ -687,8 +688,7 @@ mod tests {
     }
 
     fn fake(test: &str, processes: Vec<ProcessInfo>) -> Watcher<Fake> {
-        let dir = std::env::temp_dir().join(format!("godo-watch-{}-{test}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testdir::TestDir::new(&format!("watch-{test}"));
         Watcher::new(Fake { processes, dir })
     }
 
@@ -744,6 +744,18 @@ mod tests {
             "{}",
             row(&buf, 2).trim()
         );
+    }
+
+    #[test]
+    fn wide_target_names_keep_the_selection_aligned() {
+        let mut w = fake("wide", vec![job(1, "构建", "网站", true, None)]);
+        w.tick();
+        let buf = screen(&mut w, 60, 6);
+        // The highlight still ends at the pane's edge and the border stays put.
+        assert_eq!(buf[(28, 2)].bg, SELECTED_BG, "{}", row(&buf, 2));
+        assert_eq!(buf[(29, 2)].symbol(), "│", "{}", row(&buf, 2));
+        // ratatui clips at the border anyway, so check the line itself.
+        assert_eq!(w.target_line("构建 网站", 28).width(), 28);
     }
 
     #[test]

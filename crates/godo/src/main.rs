@@ -14,6 +14,41 @@ mod logs;
 mod proto;
 mod registry;
 mod targets;
+#[cfg(test)]
+mod testdir;
+
+#[cfg(test)]
+mod version_tests {
+    #![allow(dead_code)]
+    include!("../build/version.rs");
+
+    #[test]
+    fn a_release_build_is_the_plain_version() {
+        assert_eq!(
+            parse("godo-v0.2.0-0-gabc1234", "0.2.0").as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn anything_else_names_the_commit() {
+        assert_eq!(
+            parse("godo-v0.1.1-3-gabc1234", "0.1.1").as_deref(),
+            Some("3.gabc1234")
+        );
+        assert_eq!(
+            parse("godo-v0.2.0-0-gabc1234-dirty", "0.2.0").as_deref(),
+            Some("0.gabc1234.dirty"),
+            "uncommitted changes on the release commit"
+        );
+        assert_eq!(
+            parse("godo-v0.1.1-0-gabc1234", "0.2.0").as_deref(),
+            Some("0.gabc1234"),
+            "the version was bumped but not tagged"
+        );
+        assert_eq!(parse("something-else", "0.1.1"), None);
+    }
+}
 mod watch;
 
 use std::ffi::OsString;
@@ -26,7 +61,7 @@ use crate::config::Config;
 
 /// godo is a blacksmith for all of your build related needs
 #[derive(Parser)]
-#[command(name = "godo", version, after_help = directive_help())]
+#[command(name = "godo", version = proto::VERSION, after_help = directive_help())]
 struct Cli {
     #[command(flatten)]
     global: Global,
@@ -223,10 +258,18 @@ struct Migrate;
 struct Ps;
 
 #[derive(Args)]
-struct Stop;
+struct Stop {
+    /// stop running jobs too
+    #[arg(short, long)]
+    force: bool,
+}
 
 #[derive(Args)]
-struct Restart;
+struct Restart {
+    /// stop running jobs too
+    #[arg(short, long)]
+    force: bool,
+}
 
 #[derive(Args)]
 struct Run {
@@ -276,13 +319,13 @@ impl Handler<Ctx> for Ps {
 
 impl Handler<Ctx> for Stop {
     fn run(self, _: &mut Ctx) -> clapsmith::Result {
-        client::stop(&proto::Home::resolve()?)
+        client::stop(&proto::Home::resolve()?, self.force)
     }
 }
 
 impl Handler<Ctx> for Restart {
     fn run(self, _: &mut Ctx) -> clapsmith::Result {
-        client::restart(&proto::Home::resolve()?)
+        client::restart(&proto::Home::resolve()?, self.force)
     }
 }
 
@@ -337,7 +380,7 @@ struct Version;
 
 impl Handler<Ctx> for Version {
     fn run(self, _: &mut Ctx) -> clapsmith::Result {
-        println!("godo {}", env!("CARGO_PKG_VERSION"));
+        println!("godo {}", proto::VERSION);
         Ok(ExitCode::SUCCESS)
     }
 }

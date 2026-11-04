@@ -32,6 +32,8 @@ fail:
 \t@echo failing; exit 3
 slow:
 \t@sleep 30 & echo $$! > slow.pid; echo slow-started; wait
+big:
+\t@echo FIRST-LINE; head -c 1500000 /dev/zero | tr '\\0' x; echo; echo big-ready; sleep 30
 ",
         )
         .unwrap();
@@ -94,8 +96,25 @@ slow:
 
 impl Drop for Env {
     fn drop(&mut self) {
-        let _ = self.godo(&["stop"]);
+        let _ = self.godo(&["stop", "--force"]);
     }
+}
+
+fn stderr(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// Waits for a child to exit, or fails after a while.
+fn exits(child: &mut Child) -> std::process::ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    panic!("the process didn't exit");
 }
 
 fn interrupt(child: &Child) {
@@ -269,4 +288,138 @@ fn run_command_goes_through_the_daemon_too() {
         history.contains("misc") && history.contains("run"),
         "{history}"
     );
+}
+
+#[test]
+fn attaching_replays_all_of_a_running_jobs_output() {
+    let e = Env::new("bigattach");
+    let (mut client, _) = e.spawn_until(&["big", "app"], "big-ready");
+    interrupt(&client);
+    assert!(client.wait().unwrap().success());
+    // Over a megabyte before the last line: the first line must still come.
+    let (mut client, lines) = e.spawn_until(&["attach", "-i", "1"], "big-ready");
+    assert!(
+        lines.iter().any(|l| l == "FIRST-LINE"),
+        "missing the start: {:?}",
+        &lines[..lines.len().min(3)]
+    );
+    assert_eq!(
+        lines.iter().filter(|l| *l == "FIRST-LINE").count(),
+        1,
+        "and only once"
+    );
+    interrupt(&client);
+    std::thread::sleep(Duration::from_millis(100));
+    interrupt(&client);
+    client.wait().unwrap();
+}
+
+#[test]
+fn old_jobs_and_their_logs_are_pruned() {
+    let e = Env::new("prune");
+    for _ in 0..5 {
+        let out = e
+            .command(&e.root, &["hello", "app"])
+            .env("GODO_HISTORY_LIMIT", "3")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    }
+    let history = e.stdout(&["history"]);
+    assert_eq!(history.matches("Success").count(), 3, "{history}");
+    let mut logs: Vec<String> = std::fs::read_dir(e.home.join("logs"))
+        .unwrap()
+        .map(|f| f.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    logs.sort();
+    assert_eq!(logs, ["0.log", "3.log", "4.log", "5.log"]);
+}
+
+#[test]
+fn stop_and_restart_refuse_while_jobs_run_unless_forced() {
+    let e = Env::new("busy");
+    let (mut client, _) = e.spawn_until(&["slow", "app"], "slow-started");
+    interrupt(&client);
+    client.wait().unwrap();
+    for command in ["stop", "restart"] {
+        let out = e.godo(&[command]);
+        assert_eq!(out.status.code(), Some(1), "{command}");
+        let err = stderr(&out);
+        assert!(
+            err.contains("1 running job: 1 (slow app)") && err.contains("--force"),
+            "{err}"
+        );
+    }
+    assert!(e.stdout(&["ps"]).contains("Running"), "still running");
+    let pid_file = e.root.join("app/slow.pid");
+    wait_for("the pid file", || pid_file.exists());
+    let sleeper: i32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        e.stdout(&["stop", "--force"])
+            .contains("Daemon shutdown requested.")
+    );
+    wait_for("the job's children to stop", || !alive(sleeper));
+}
+
+#[test]
+fn an_idle_daemon_of_another_version_is_replaced() {
+    let e = Env::new("upgrade");
+    let mut old = e
+        .command(e.home.parent().unwrap(), &["daemon"])
+        .env("GODO_VERSION_OVERRIDE", "0.0.1-old")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for("the old daemon", || e.home.join("godo.sock").exists());
+    let out = e.godo(&["hello", "app"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("restarted the daemon (0.0.1-old →"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(exits(&mut old).success(), "the old daemon stopped");
+}
+
+#[test]
+fn a_busy_daemon_of_another_version_is_left_alone() {
+    let e = Env::new("upgrade-busy");
+    // An "older" client and daemon, with a job still running.
+    let mut old = e
+        .command(&e.root, &["slow", "app"])
+        .env("GODO_VERSION_OVERRIDE", "0.0.1-old")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid_file = e.root.join("app/slow.pid");
+    wait_for("the old job", || pid_file.exists());
+    interrupt(&old);
+    old.wait().unwrap();
+    let out = e.godo(&["hello", "app"]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = stderr(&out);
+    assert!(
+        err.contains("version 0.0.1-old and has 1 running job")
+            && err.contains("godo restart --force"),
+        "{err}"
+    );
+    // Forcing works across versions.
+    assert!(
+        e.stdout(&["restart", "--force"])
+            .contains("Daemon started.")
+    );
+    assert!(e.godo(&["hello", "app"]).status.success());
+}
+
+#[test]
+fn version_names_the_build() {
+    let e = Env::new("version");
+    let out = e.stdout(&["--version"]);
+    let want = format!("godo {}", env!("CARGO_PKG_VERSION"));
+    assert!(out.starts_with(&want), "{out}");
 }

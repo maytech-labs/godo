@@ -74,25 +74,92 @@ fn start_daemon(home: &Home) -> clapsmith::Result<()> {
     Ok(())
 }
 
+/// Sends a request and reads the first reply. A daemon of another version
+/// with no running jobs is replaced first; one with running jobs is left
+/// alone and reported. `None` if no daemon runs and `start` is false.
+fn open(
+    home: &Home,
+    request: &Request,
+    start: bool,
+) -> clapsmith::Result<Option<(UnixStream, Event)>> {
+    let mut replaced = false;
+    loop {
+        let mut stream = match (connect(home), start) {
+            (Some(stream), _) => stream,
+            (None, true) => connect_or_start(home)?,
+            (None, false) => return Ok(None),
+        };
+        proto::write(&mut stream, &Envelope::new(request.clone()))?;
+        let first =
+            proto::read::<Event>(&mut stream)?.ok_or("the godo daemon closed the connection")?;
+        match first {
+            Event::VersionMismatch {
+                daemon_version,
+                running,
+            } if running == 0 && !replaced => {
+                replace_daemon(home, &daemon_version)?;
+                replaced = true;
+            }
+            Event::VersionMismatch {
+                daemon_version,
+                running,
+            } => {
+                return Err(format!(
+                    "the godo daemon is version {daemon_version} and has {running} running job{}, but this godo is {}; let {} finish, or run `godo restart --force` to stop {}",
+                    if running == 1 { "" } else { "s" },
+                    proto::wire_version(),
+                    if running == 1 { "it" } else { "them" },
+                    if running == 1 { "it" } else { "them" },
+                )
+                .into());
+            }
+            first => return Ok(Some((stream, first))),
+        }
+    }
+}
+
+/// Stops an idle daemon of another version and starts this one.
+fn replace_daemon(home: &Home, old: &str) -> clapsmith::Result<()> {
+    if let Some(mut stream) = connect(home) {
+        proto::write(
+            &mut stream,
+            &Envelope::new(Request::Shutdown { force: false }),
+        )?;
+        let _ = proto::read::<Event>(&mut stream);
+    }
+    wait_until_stopped(home);
+    eprintln!(
+        "godo: restarted the daemon ({old} → {})",
+        proto::wire_version()
+    );
+    connect_or_start(home).map(drop)
+}
+
+fn wait_until_stopped(home: &Home) {
+    for _ in 0..100 {
+        if connect(home).is_none() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Sends one request and reads one reply.
-fn ask(mut stream: UnixStream, request: Request) -> clapsmith::Result<Event> {
-    proto::write(&mut stream, &Envelope::new(request))?;
-    match proto::read::<Event>(&mut stream)? {
-        Some(Event::Error { message }) => Err(message.into()),
-        Some(event) => Ok(event),
-        None => Err("the godo daemon closed the connection".into()),
+fn ask(home: &Home, request: Request, start: bool) -> clapsmith::Result<Option<Event>> {
+    match open(home, &request, start)? {
+        None => Ok(None),
+        Some((_, Event::Error { message })) => Err(message.into()),
+        Some((_, event)) => Ok(Some(event)),
     }
 }
 
 /// Every job the daemon knows, with the daemon first. Empty if no daemon
 /// is running.
 pub fn processes(home: &Home) -> clapsmith::Result<Vec<ProcessInfo>> {
-    let Some(stream) = connect(home) else {
-        return Ok(Vec::new());
-    };
-    match ask(stream, Request::Ps)? {
-        Event::Processes { processes } => Ok(processes),
-        other => Err(format!("unexpected reply from the daemon: {other:?}").into()),
+    match ask(home, Request::Ps, false)? {
+        None => Ok(Vec::new()),
+        Some(Event::Processes { processes }) => Ok(processes),
+        Some(other) => Err(format!("unexpected reply from the daemon: {other:?}").into()),
     }
 }
 
@@ -119,7 +186,7 @@ pub fn run(home: &Home, job: Job) -> clapsmith::Result {
         cols,
         rows,
     };
-    follow(home, connect_or_start(home)?, request)
+    follow(home, request, true)
 }
 
 /// `godo attach -i <id>`: replays a job's output and follows it.
@@ -128,11 +195,11 @@ pub fn attach(home: &Home, id: &str) -> clapsmith::Result {
         .trim_matches('"')
         .parse()
         .map_err(|_| format!("`{id}` isn't a process ID; see `godo ps`"))?;
-    let Some(stream) = connect(home) else {
+    if connect(home).is_none() {
         println!("Daemon not running.");
         return Ok(ExitCode::SUCCESS);
-    };
-    follow(home, stream, Request::Attach { id })
+    }
+    follow(home, Request::Attach { id }, false)
 }
 
 enum Msg {
@@ -141,9 +208,13 @@ enum Msg {
     Interrupt,
 }
 
-fn follow(home: &Home, mut stream: UnixStream, request: Request) -> clapsmith::Result {
-    proto::write(&mut stream, &Envelope::new(request))?;
+fn follow(home: &Home, request: Request, start: bool) -> clapsmith::Result {
+    let Some((stream, first)) = open(home, &request, start)? else {
+        println!("Daemon not running.");
+        return Ok(ExitCode::SUCCESS);
+    };
     let (tx, rx) = mpsc::channel();
+    let _ = tx.send(Msg::Event(first));
     let mut reader = stream.try_clone()?;
     let events = tx.clone();
     std::thread::spawn(move || {
@@ -205,8 +276,8 @@ fn follow_events(home: &Home, rx: &mpsc::Receiver<Msg>) -> clapsmith::Result {
             Msg::Closed => return Err("lost the connection to the daemon".into()),
             Msg::Interrupt => match first_interrupt {
                 Some(at) if at.elapsed() < DOUBLE_PRESS => {
-                    if let (Some(id), Some(stream)) = (id, connect(home)) {
-                        let _ = ask(stream, Request::Kill { id });
+                    if let Some(id) = id {
+                        let _ = ask(home, Request::Kill { id }, false);
                     }
                     say("Killing process...");
                     return Ok(ExitCode::from(130));
@@ -296,34 +367,41 @@ pub fn history(home: &Home) -> clapsmith::Result {
 }
 
 pub fn history_clear(home: &Home) -> clapsmith::Result {
-    let Some(stream) = connect(home) else {
-        println!("Daemon not running.");
-        return Ok(ExitCode::SUCCESS);
-    };
-    ask(stream, Request::HistoryClear)?;
-    println!("History cleared.");
-    Ok(ExitCode::SUCCESS)
-}
-
-pub fn stop(home: &Home) -> clapsmith::Result {
-    let Some(stream) = connect(home) else {
-        println!("Daemon not running.");
-        return Ok(ExitCode::SUCCESS);
-    };
-    ask(stream, Request::Shutdown)?;
-    // Wait for the socket to go, so a following start doesn't race it.
-    for _ in 0..50 {
-        if connect(home).is_none() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
+    match ask(home, Request::HistoryClear, false)? {
+        None => println!("Daemon not running."),
+        Some(_) => println!("History cleared."),
     }
-    println!("Daemon shutdown requested.");
     Ok(ExitCode::SUCCESS)
 }
 
-pub fn restart(home: &Home) -> clapsmith::Result {
-    stop(home)?;
+/// `godo stop [--force]`: refuses while jobs run, unless forced.
+pub fn stop(home: &Home, force: bool) -> clapsmith::Result {
+    match ask(home, Request::Shutdown { force }, false)? {
+        None => println!("Daemon not running."),
+        Some(Event::Busy { running }) => {
+            let jobs: Vec<String> = running
+                .iter()
+                .map(|p| format!("{} ({} {})", p.id, p.directive, p.target))
+                .collect();
+            return Err(format!(
+                "the daemon has {} running job{}: {}. Stopping it would stop them too; use --force for that, or `godo attach -i <id>` to see them",
+                running.len(),
+                if running.len() == 1 { "" } else { "s" },
+                jobs.join(", ")
+            )
+            .into());
+        }
+        Some(_) => {
+            // Wait for the socket to go, so a following start doesn't race it.
+            wait_until_stopped(home);
+            println!("Daemon shutdown requested.");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+pub fn restart(home: &Home, force: bool) -> clapsmith::Result {
+    stop(home, force)?;
     connect_or_start(home)?;
     println!("Daemon started.");
     Ok(ExitCode::SUCCESS)
