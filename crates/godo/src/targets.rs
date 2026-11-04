@@ -16,18 +16,10 @@ use crate::config::Config;
 /// `make -C <target dir> <directive> [make args...]` with `GODO_ROOT` set to
 /// the root, through the daemon in a terminal and in the foreground elsewhere.
 pub fn run(config: &Config, words: &[OsString], verbose: bool) -> clapsmith::Result {
-    let [directive, target, extra @ ..] = words else {
-        return Err(match words.first() {
-            Some(word) => format!(
-                "`{}` isn't a godo command. To run a Makefile target, name the target too: godo {} <target>",
-                word.to_string_lossy(),
-                word.to_string_lossy(),
-            ),
-            None => "missing directive and target".to_string(),
-        }
-        .into());
-    };
-    let name = target.to_string_lossy();
+    let parsed = parse_words(words)?;
+    let verbose = verbose || parsed.verbose;
+    let (directive, target, extra) = (&parsed.directive, &parsed.target, &parsed.extra);
+    let name = target.to_string_lossy().into_owned();
     let Some(target) = config.target(&name) else {
         return Err(unknown_target(config, &name).into());
     };
@@ -58,6 +50,62 @@ pub fn run(config: &Config, words: &[OsString], verbose: bool) -> clapsmith::Res
         .status()
         .map_err(|error| format!("can't run make: {error}"))?;
     Ok(exit_code(status))
+}
+
+/// `godo <directive> <target> [words...] [-- make args...]`, taken apart.
+#[derive(Debug, PartialEq)]
+pub struct Words {
+    pub directive: OsString,
+    pub target: OsString,
+    /// For make: plain words and `VAR=value`, then everything after `--`.
+    pub extra: Vec<OsString>,
+    pub verbose: bool,
+}
+
+/// godo's own flags (`-v`) count wherever they are, up to `--`. Other
+/// words go to make, but a flag make should get has to come after `--`,
+/// so a mistyped godo flag never silently becomes make's.
+pub fn parse_words(words: &[OsString]) -> clapsmith::Result<Words> {
+    let mut positional: Vec<OsString> = Vec::new();
+    let mut after: Vec<OsString> = Vec::new();
+    let mut verbose = false;
+    let mut iter = words.iter();
+    for word in iter.by_ref() {
+        let text = word.to_string_lossy();
+        match text.as_ref() {
+            "--" => break,
+            "-v" | "--verbose" => verbose = true,
+            flag if flag.starts_with('-') && flag.len() > 1 => {
+                return Err(format!(
+                    "`{flag}` isn't a godo flag. To pass it to make, put it after `--`: godo {} {} -- {flag}",
+                    positional.first().map_or("<directive>".into(), |d| d.to_string_lossy()),
+                    positional.get(1).map_or("<target>".into(), |t| t.to_string_lossy()),
+                )
+                .into());
+            }
+            _ => positional.push(word.clone()),
+        }
+    }
+    after.extend(iter.cloned());
+    let mut positional = positional.into_iter();
+    let (Some(directive), target) = (positional.next(), positional.next()) else {
+        return Err("missing directive and target".into());
+    };
+    let Some(target) = target else {
+        let word = directive.to_string_lossy();
+        return Err(format!(
+            "`{word}` isn't a godo command. To run a Makefile target, name the target too: godo {word} <target>"
+        )
+        .into());
+    };
+    let mut extra: Vec<OsString> = positional.collect();
+    extra.extend(after);
+    Ok(Words {
+        directive,
+        target,
+        extra,
+        verbose,
+    })
 }
 
 pub(crate) fn unknown_target(config: &Config, name: &str) -> String {
@@ -204,6 +252,49 @@ mod tests {
 
     fn names(makefile: &str) -> Vec<String> {
         make_targets(makefile).into_iter().map(|t| t.name).collect()
+    }
+
+    fn words(args: &[&str]) -> clapsmith::Result<Words> {
+        let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+        parse_words(&args)
+    }
+
+    fn os(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn godo_flags_count_anywhere_before_dashdash() {
+        let w = words(&["build", "web", "-v"]).unwrap();
+        assert!(w.verbose);
+        assert!(w.extra.is_empty());
+        let w = words(&["build", "-v", "web"]).unwrap();
+        assert_eq!(
+            (w.directive.as_os_str(), w.target.as_os_str()),
+            ("build".as_ref(), "web".as_ref())
+        );
+        assert!(w.verbose);
+    }
+
+    #[test]
+    fn make_gets_words_vars_and_everything_after_dashdash() {
+        let w = words(&["build", "web", "FOO=1", "test", "--", "-j8", "-v"]).unwrap();
+        assert_eq!(w.extra, os(&["FOO=1", "test", "-j8", "-v"]));
+        assert!(!w.verbose, "-v after -- is make's");
+    }
+
+    #[test]
+    fn an_unknown_flag_points_at_dashdash() {
+        let err = words(&["build", "web", "-j8"]).unwrap_err().to_string();
+        assert!(err.contains("godo build web -- -j8"), "{err}");
+    }
+
+    #[test]
+    fn a_directive_alone_explains_itself() {
+        let err = words(&["dev"]).unwrap_err().to_string();
+        assert!(err.contains("godo dev <target>"), "{err}");
+        let err = words(&["dev", "-v"]).unwrap_err().to_string();
+        assert!(err.contains("godo dev <target>"), "{err}");
     }
 
     #[test]

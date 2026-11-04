@@ -32,6 +32,10 @@ fail:
 \t@echo failing; exit 3
 slow:
 \t@sleep 30 & echo $$! > slow.pid; echo slow-started; wait
+ask:
+\t@printf 'name? '; read n; echo \"hello $$n\"
+size:
+\t@stty size; trap 'stty size' WINCH; for i in 1 2 3 4 5 6 7 8 9 10; do sleep 0.3; done
 big:
 \t@echo FIRST-LINE; head -c 1500000 /dev/zero | tr '\\0' x; echo; echo big-ready; sleep 30
 ",
@@ -75,7 +79,8 @@ big:
             // Keep reading after the caller stops listening, so godo never
             // writes into a closed pipe.
             for line in BufReader::new(out).lines().map_while(Result::ok) {
-                let _ = tx.send(line);
+                // Job output comes as the terminal wrote it, with \r\n.
+                let _ = tx.send(line.trim_end_matches('\r').to_string());
             }
         });
         let mut lines = Vec::new();
@@ -244,7 +249,7 @@ fn ctrl_c_detaches_and_ctrl_c_twice_kills_the_whole_job() {
 #[test]
 fn stop_and_restart_the_daemon() {
     let e = Env::new("stop");
-    assert!(e.stdout(&["ps"]).contains("Daemon not running."));
+    assert!(e.stdout(&["ps"]).contains("the daemon isn't running"));
     let _ = e.godo(&["hello", "app"]);
     assert!(e.home.join("godo.sock").exists());
     assert!(e.stdout(&["restart"]).contains("Daemon started."));
@@ -422,4 +427,175 @@ fn version_names_the_build() {
     let out = e.stdout(&["--version"]);
     let want = format!("godo {}", env!("CARGO_PKG_VERSION"));
     assert!(out.starts_with(&want), "{out}");
+}
+
+/// godo running in a real pseudo-terminal, as when typed at a shell: keys
+/// written here arrive as keystrokes, Ctrl+C included.
+struct Tty {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    writer: Box<dyn std::io::Write + Send>,
+    output: std::sync::Arc<std::sync::Mutex<String>>,
+}
+
+impl Tty {
+    fn spawn(e: &Env, args: &[&str]) -> Self {
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut cmd = portable_pty::CommandBuilder::new(env!("CARGO_BIN_EXE_godo"));
+        cmd.args(args);
+        cmd.cwd(&e.root);
+        cmd.env("GODO_HOME", &e.home);
+        cmd.env("TERM", "xterm-256color");
+        cmd.env_remove("GODO_DAEMON");
+        let child = pair.slave.spawn_command(cmd).unwrap();
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let writer = pair.master.take_writer().unwrap();
+        let output = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = std::sync::Arc::clone(&output);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = std::io::Read::read(&mut reader, &mut buf) {
+                if n == 0 {
+                    break;
+                }
+                sink.lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        });
+        Self {
+            child,
+            master: pair.master,
+            writer,
+            output,
+        }
+    }
+
+    fn output(&self) -> String {
+        self.output.lock().unwrap().clone()
+    }
+
+    fn wait_for(&self, text: &str) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if self.output().contains(text) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("never saw {text:?} in {:?}", self.output());
+    }
+
+    fn type_keys(&mut self, keys: &[u8]) {
+        self.writer.write_all(keys).unwrap();
+        self.writer.flush().unwrap();
+    }
+
+    fn exit_code(&mut self) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status.exit_code();
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = self.child.kill();
+        panic!("godo didn't exit: {:?}", self.output());
+    }
+}
+
+#[test]
+fn typing_reaches_the_job() {
+    let e = Env::new("tty-input");
+    let mut tty = Tty::spawn(&e, &["ask", "app"]);
+    tty.wait_for("name? ");
+    tty.type_keys(b"bob\r");
+    tty.wait_for("hello bob");
+    assert_eq!(tty.exit_code(), 0);
+}
+
+#[test]
+fn ctrl_c_keystrokes_detach_and_kill() {
+    let e = Env::new("tty-ctrlc");
+    let mut tty = Tty::spawn(&e, &["slow", "app"]);
+    tty.wait_for("slow-started");
+    tty.type_keys(&[0x03]);
+    tty.wait_for("Detaching");
+    assert_eq!(tty.exit_code(), 0);
+    assert!(
+        e.stdout(&["ps"]).contains("Running"),
+        "detached, still running"
+    );
+
+    let mut tty = Tty::spawn(&e, &["attach", "-i", "1"]);
+    tty.wait_for("slow-started");
+    tty.type_keys(&[0x03, 0x03]);
+    tty.wait_for("Killing process...");
+    assert_eq!(tty.exit_code(), 130);
+    wait_for("the job to end", || {
+        e.stdout(&["ps"]).contains("No running processes.")
+    });
+}
+
+#[test]
+fn resizing_the_terminal_resizes_the_job() {
+    let e = Env::new("tty-resize");
+    let mut tty = Tty::spawn(&e, &["size", "app"]);
+    tty.wait_for("24 80");
+    tty.master
+        .resize(portable_pty::PtySize {
+            rows: 30,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    tty.wait_for("30 100");
+    assert_eq!(tty.exit_code(), 0);
+}
+
+#[test]
+fn progress_output_keeps_its_carriage_returns() {
+    let e = Env::new("raw-output");
+    let out = e
+        .command(
+            &e.root,
+            &["run", "-c", "printf 'a 10%%\\rb 90%%\\n'", "-t", "p"],
+        )
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("a 10%\rb 90%"), "{text:?}");
+}
+
+#[test]
+fn ps_history_and_attach_work_without_the_daemon() {
+    let e = Env::new("offline");
+    let _ = e.godo(&["hello", "app"]);
+    assert!(e.stdout(&["stop"]).contains("Daemon shutdown requested."));
+    assert!(e.stdout(&["ps"]).contains("the daemon isn't running"));
+    let history = e.stdout(&["history"]);
+    assert!(
+        history.contains("hello") && history.contains("Success"),
+        "{history}"
+    );
+    let out = e.godo(&["attach", "-i", "1"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("hello from app") && text.contains("Process exited with code: 0"),
+        "{text}"
+    );
+    assert!(out.status.success());
+    assert!(
+        !e.home.join("godo.sock").exists(),
+        "none of that started the daemon"
+    );
 }

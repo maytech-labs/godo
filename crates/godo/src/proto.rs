@@ -159,6 +159,16 @@ pub enum Request {
     },
 }
 
+/// What a client may send after `run` or `attach`, while following a job.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ClientMsg {
+    /// Keystrokes for the job's terminal.
+    Input { data: Vec<u8> },
+    /// The client's terminal changed size; the job's follows.
+    Resize { cols: u16, rows: u16 },
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {

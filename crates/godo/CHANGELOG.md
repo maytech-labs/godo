@@ -6,9 +6,13 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ### Added
 
-- **`godo watch`**: the live dashboard from the C++ godo, ported to ratatui with the same layout, colours, and keys. A TARGETS pane lists every `directive target` started since watch opened, plus the daemon, with a status dot (green running, red failed, yellow succeeded, yellow ○ nothing yet). The LOGS pane follows the selected target, wraps, keeps colours, and announces exits. q/Esc quits; ↑↓/j/k move or scroll; PgUp/PgDn and the mouse wheel scroll. Changes from the C++ version: scrolling stops at the top of the logs, and Ctrl+C also quits.
+- **`godo watch`**: the live dashboard from the C++ godo, ported to ratatui with the same layout and colours. A TARGETS pane lists each `directive target` whose newest job is running or started in the last day (`--since 2h`, `--all`), plus the daemon, with a status dot (green running, red failed, yellow succeeded, yellow ○ no jobs left); it scrolls with the selection and shows `▲/▼ N more`. The LOGS pane follows the selected target and draws output as a terminal would, so progress bars update in place. ↑↓/jk choose a target; PgUp/PgDn, Ctrl+U/Ctrl+D, and the wheel scroll; g/G jump to the top or bottom; q, Esc, or Ctrl+C quits. A footer lists the keys.
+- **`godo history`** in a terminal: the C++ godo's full-screen history, newest first. Enter opens a job's logs (followed live if it's running); q goes back. Outside a terminal it prints a table.
 - **The daemon.** In a terminal, `godo <directive> <target>` and `godo run -c <cmd> -t <target> [-d <directive>]` run in a per-user background daemon, in a pseudo-terminal. Ctrl+C detaches; Ctrl+C twice quickly kills. Logs and history are kept. Outside a terminal (CI, pipes) runs stay in the foreground; `GODO_DAEMON=1` or `0` overrides.
-- `godo ps`, `godo attach -i <id>`, `godo stop`, `godo restart`, `godo history [--clear]`.
+- `godo ps`, `godo attach -i <id>`, `godo stop`, `godo restart`, `godo history [--clear]`. `ps`, `history`, and `attach` to finished jobs work without the daemon, from its saved history.
+- While you follow a job in a terminal, your keystrokes go to it, so prompts and interactive tools work; Ctrl+C stays godo's (once detaches, twice kills). Resizing your terminal resizes the job's.
+- godo's flags (`-v`) work anywhere in `godo <directive> <target> ...`. `VAR=value` and plain words still go to make; make's flags go after `--`: `godo build web -- -j8`. An unknown flag before `--` is an error that says so.
+- Job output is kept as written, `\r` included, so terminals and `watch` draw progress bars properly.
 
 ### Fixed (compared with the C++ godo)
 

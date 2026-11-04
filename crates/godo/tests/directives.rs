@@ -210,3 +210,31 @@ fn help_explains_directives() {
     let text = stdout(&p.godo(&p.root, &["--help"]));
     assert!(text.contains("godo <directive> <target>"), "{text}");
 }
+
+#[test]
+fn godo_flags_work_after_the_target() {
+    let p = Project::new("flag-after");
+    let out = p.godo(&p.root, &["dev", "web", "-v"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("godo: make --no-print-directory -C"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn make_flags_go_after_dashdash() {
+    let p = Project::new("dashdash");
+    let out = p.godo(&p.root, &["dev", "web", "-j8"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains("godo dev web -- -j8"),
+        "{}",
+        stderr(&out)
+    );
+    // After --, make gets it: -s is make's "silent", ARGS reaches the recipe.
+    let out = p.godo(&p.root, &["dev", "web", "--", "-s", "ARGS=after"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("args=after"), "{}", stdout(&out));
+}

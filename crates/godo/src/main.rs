@@ -10,12 +10,14 @@
 mod client;
 mod config;
 mod daemon;
+mod history;
 mod logs;
 mod proto;
 mod registry;
 mod targets;
 #[cfg(test)]
 mod testdir;
+mod tui;
 
 #[cfg(test)]
 mod version_tests {
@@ -79,7 +81,7 @@ fn directive_help() -> StyledStr {
     let _ = writeln!(out, "{}Targets:{:#}", t.heading, t.heading);
     let _ = writeln!(
         out,
-        "  $ {title}godo{title:#} {dim}<directive> <target> [make args]{dim:#}"
+        "  $ {title}godo{title:#} {dim}<directive> <target> [VAR=value...] [-- make flags]{dim:#}"
     );
     let _ = writeln!(
         out,
@@ -89,7 +91,14 @@ fn directive_help() -> StyledStr {
         out,
         "  Runs {cmd}make <directive>{cmd:#} in a registered target's directory."
     );
-    let _ = write!(out, "  Built-in commands take precedence over directives.");
+    let _ = writeln!(
+        out,
+        "  Built-in commands take precedence over directives. godo's flags (-v) can go"
+    );
+    let _ = write!(
+        out,
+        "  anywhere; flags for make go after --, e.g. {cmd}godo build web -- -j8{cmd:#}."
+    );
     out
 }
 
@@ -285,7 +294,14 @@ struct Run {
 }
 
 #[derive(Args)]
-struct Watch;
+struct Watch {
+    /// show targets with a job this recent, e.g. 30m, 2h, 7d [default: 24h]
+    #[arg(long, value_name = "AGE", conflicts_with = "all")]
+    since: Option<String>,
+    /// show every target in history
+    #[arg(long)]
+    all: bool,
+}
 
 #[derive(Args)]
 struct History {
@@ -331,15 +347,23 @@ impl Handler<Ctx> for Restart {
 
 impl Handler<Ctx> for Watch {
     fn run(self, _: &mut Ctx) -> clapsmith::Result {
-        watch::run(proto::Home::resolve()?)
+        let since = match (self.all, self.since) {
+            (true, _) => None,
+            (false, Some(age)) => Some(watch::parse_duration(&age)?),
+            (false, None) => Some(watch::DEFAULT_SINCE),
+        };
+        watch::run(proto::Home::resolve()?, since)
     }
 }
 
 impl Handler<Ctx> for History {
     fn run(self, _: &mut Ctx) -> clapsmith::Result {
+        use std::io::IsTerminal;
         let home = proto::Home::resolve()?;
         if self.clear {
             client::history_clear(&home)
+        } else if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
+            history::run(home)
         } else {
             client::history(&home)
         }

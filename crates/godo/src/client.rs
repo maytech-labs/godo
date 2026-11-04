@@ -196,8 +196,22 @@ pub fn attach(home: &Home, id: &str) -> clapsmith::Result {
         .parse()
         .map_err(|_| format!("`{id}` isn't a process ID; see `godo ps`"))?;
     if connect(home).is_none() {
-        println!("Daemon not running.");
-        return Ok(ExitCode::SUCCESS);
+        // Nothing runs without the daemon, so replay the saved log.
+        let Some(job) = saved_history(home).into_iter().find(|p| p.id == id) else {
+            return Err(format!("no process with ID {id}").into());
+        };
+        println!("Attached to process ID: {id}");
+        print!("{}", crate::logs::read(&home.log(id)));
+        return Ok(match job.exit_code {
+            Some(code) => {
+                println!("\nProcess exited with code: {code}");
+                ExitCode::from(u8::try_from(code).unwrap_or(1))
+            }
+            None => {
+                println!("\nProcess stopped when the daemon did.");
+                ExitCode::FAILURE
+            }
+        });
     }
     follow(home, Request::Attach { id }, false)
 }
@@ -206,6 +220,28 @@ enum Msg {
     Event(Event),
     Closed,
     Interrupt,
+}
+
+/// Raw mode for following a job in a terminal: keystrokes go to the job
+/// as they're typed, and Ctrl+C arrives as a byte godo handles itself.
+/// Restored when dropped.
+struct RawMode;
+
+impl RawMode {
+    fn enter() -> Option<Self> {
+        use std::io::IsTerminal;
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            return None;
+        }
+        ratatui::crossterm::terminal::enable_raw_mode().ok()?;
+        Some(Self)
+    }
+}
+
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        let _ = ratatui::crossterm::terminal::disable_raw_mode();
+    }
 }
 
 fn follow(home: &Home, request: Request, start: bool) -> clapsmith::Result {
@@ -225,24 +261,103 @@ fn follow(home: &Home, request: Request, start: bool) -> clapsmith::Result {
         }
         let _ = events.send(Msg::Closed);
     });
-    let mut signals = signal_hook::iterator::Signals::new([libc::SIGINT])?;
+    let writer = std::sync::Arc::new(std::sync::Mutex::new(stream));
+    let raw = RawMode::enter();
+    if raw.is_some() {
+        forward_keys(std::sync::Arc::clone(&writer), tx.clone());
+    }
+    let mut signals = signal_hook::iterator::Signals::new([libc::SIGINT, libc::SIGWINCH])?;
     let handle = signals.handle();
+    let resizes = std::sync::Arc::clone(&writer);
     std::thread::spawn(move || {
-        for _ in signals.forever() {
-            if tx.send(Msg::Interrupt).is_err() {
+        for signal in signals.forever() {
+            if signal == libc::SIGWINCH {
+                send_size(&resizes);
+            } else if tx.send(Msg::Interrupt).is_err() {
                 return;
             }
         }
     });
-    let result = follow_events(home, &rx);
+    let out = Out { raw: raw.is_some() };
+    let result = follow_events(home, &rx, &out);
     handle.close();
+    drop(raw);
     result
 }
 
-fn follow_events(home: &Home, rx: &mpsc::Receiver<Msg>) -> clapsmith::Result {
+/// Sends the job this terminal's size, so it draws to fit.
+fn send_size(writer: &std::sync::Mutex<UnixStream>) {
+    if let Ok((cols, rows)) = ratatui::crossterm::terminal::size() {
+        let mut stream = writer.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = proto::write(&mut *stream, &proto::ClientMsg::Resize { cols, rows });
+    }
+}
+
+/// Copies keystrokes to the job, except Ctrl+C, which is godo's: once
+/// detaches, twice kills.
+fn forward_keys(writer: std::sync::Arc<std::sync::Mutex<UnixStream>>, tx: mpsc::Sender<Msg>) {
+    send_size(&writer);
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut stdin = io::stdin();
+        let mut buf = [0u8; 1024];
+        loop {
+            let n = match stdin.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => n,
+            };
+            for part in split_interrupts(&buf[..n]) {
+                let sent = match part {
+                    Some(data) => {
+                        let mut stream = writer.lock().unwrap_or_else(|e| e.into_inner());
+                        proto::write(&mut *stream, &proto::ClientMsg::Input { data }).is_ok()
+                    }
+                    None => tx.send(Msg::Interrupt).is_ok(),
+                };
+                if !sent {
+                    return;
+                }
+            }
+        }
+    });
+}
+
+/// Splits typed bytes at each Ctrl+C (`None`), keeping the rest in order.
+fn split_interrupts(bytes: &[u8]) -> Vec<Option<Vec<u8>>> {
+    let mut out = Vec::new();
+    for (i, chunk) in bytes.split(|&b| b == 0x03).enumerate() {
+        if i > 0 {
+            out.push(None);
+        }
+        if !chunk.is_empty() {
+            out.push(Some(chunk.to_vec()));
+        }
+    }
+    out
+}
+
+/// godo's own messages while following, with `\r\n` line ends in raw mode.
+struct Out {
+    raw: bool,
+}
+
+impl Out {
+    fn say(&self, line: &str) {
+        let text = if self.raw {
+            format!("{}\r\n", line.replace('\n', "\r\n"))
+        } else {
+            format!("{line}\n")
+        };
+        let mut out = io::stdout();
+        let _ = out.write_all(text.as_bytes());
+        let _ = out.flush();
+    }
+}
+
+fn follow_events(home: &Home, rx: &mpsc::Receiver<Msg>, out: &Out) -> clapsmith::Result {
     let mut id = None;
     let mut first_interrupt: Option<Instant> = None;
-    let mut out = io::stdout();
+    let mut stdout = io::stdout();
     loop {
         let msg = match first_interrupt {
             Some(at) => match rx.recv_timeout(DETACH_WAIT.saturating_sub(at.elapsed())) {
@@ -255,20 +370,20 @@ fn follow_events(home: &Home, rx: &mpsc::Receiver<Msg>) -> clapsmith::Result {
         match msg {
             Msg::Event(Event::Started { id: started }) => {
                 id = Some(started);
-                say(&format!(
+                out.say(&format!(
                     "Process started with ID: {started} (Ctrl+C to detach, Ctrl+C Ctrl+C to kill)"
                 ));
             }
             Msg::Event(Event::Attached { id: attached }) => {
                 id = Some(attached);
-                say(&format!("Attached to process ID: {attached}"));
+                out.say(&format!("Attached to process ID: {attached}"));
             }
             Msg::Event(Event::Log { stream, data }) => {
-                let _ = out.write_all(crate::logs::styled(&stream, &data).as_bytes());
-                let _ = out.flush();
+                let _ = stdout.write_all(crate::logs::styled(&stream, &data).as_bytes());
+                let _ = stdout.flush();
             }
             Msg::Event(Event::Exit { code }) => {
-                say(&format!("\nProcess exited with code: {code}"));
+                out.say(&format!("\nProcess exited with code: {code}"));
                 return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
             }
             Msg::Event(Event::Error { message }) => return Err(message.into()),
@@ -279,38 +394,62 @@ fn follow_events(home: &Home, rx: &mpsc::Receiver<Msg>) -> clapsmith::Result {
                     if let Some(id) = id {
                         let _ = ask(home, Request::Kill { id }, false);
                     }
-                    say("Killing process...");
+                    out.say("Killing process...");
                     return Ok(ExitCode::from(130));
                 }
                 _ => {
                     first_interrupt = Some(Instant::now());
-                    say("\nDetaching (press Ctrl+C again quickly to kill)...");
+                    out.say("\nDetaching (press Ctrl+C again quickly to kill)...");
                 }
             },
         }
     }
 }
 
-/// Prints a line, ignoring a closed stdout (`godo build web | head`):
-/// the job's fate mustn't depend on whether anyone still reads.
-fn say(line: &str) {
-    let mut out = io::stdout();
-    let _ = writeln!(out, "{line}");
-    let _ = out.flush();
+/// Every job: from the daemon if it runs, else from its saved history,
+/// where nothing can still be running. The daemon itself isn't included.
+pub fn jobs(home: &Home) -> clapsmith::Result<Vec<ProcessInfo>> {
+    let jobs = if connect(home).is_some() {
+        processes(home)?
+    } else {
+        saved_history(home)
+    };
+    Ok(jobs.into_iter().filter(|p| p.id != 0).collect())
+}
+
+/// `history.json` as the daemon left it. Jobs it recorded as running
+/// ended when it stopped, so they're shown as stopped.
+pub fn saved_history(home: &Home) -> Vec<ProcessInfo> {
+    let mut jobs: Vec<ProcessInfo> = std::fs::read_to_string(home.history())
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
+    for job in &mut jobs {
+        job.running = false;
+    }
+    jobs
+}
+
+/// How `history` describes a job.
+pub fn status(p: &ProcessInfo) -> &'static str {
+    match (p.running, p.exit_code) {
+        (true, _) => "Running",
+        (false, Some(0)) => "Success",
+        (false, Some(_)) => "Failed",
+        // Ended without an exit code: the daemon stopped while it ran.
+        (false, None) => "Stopped",
+    }
 }
 
 /// `godo ps`: running jobs as a table.
 pub fn ps(home: &Home) -> clapsmith::Result {
     if connect(home).is_none() {
-        println!("Daemon not running.");
+        println!("No running processes (the daemon isn't running).");
         return Ok(ExitCode::SUCCESS);
     }
-    let running: Vec<ProcessInfo> = processes(home)?
-        .into_iter()
-        .filter(|p| p.running && p.id != 0)
-        .collect();
-    let rows: Vec<Vec<String>> = running
+    let rows: Vec<Vec<String>> = jobs(home)?
         .iter()
+        .filter(|p| p.running)
         .map(|p| {
             vec![
                 p.id.to_string(),
@@ -331,27 +470,18 @@ pub fn ps(home: &Home) -> clapsmith::Result {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `godo history`: every job, newest first.
+/// `godo history` outside a terminal: every job, newest first, as a table.
 pub fn history(home: &Home) -> clapsmith::Result {
-    if connect(home).is_none() {
-        println!("Daemon not running.");
-        return Ok(ExitCode::SUCCESS);
-    }
-    let mut jobs: Vec<ProcessInfo> = processes(home)?.into_iter().filter(|p| p.id != 0).collect();
+    let mut jobs = jobs(home)?;
     jobs.reverse();
     let rows: Vec<Vec<String>> = jobs
         .iter()
         .map(|p| {
-            let status = match (p.running, p.exit_code) {
-                (true, _) => "Running",
-                (false, Some(0)) => "Success",
-                _ => "Failed",
-            };
             vec![
                 p.id.to_string(),
                 p.target.clone(),
                 p.directive.clone(),
-                status.to_string(),
+                status(p).to_string(),
                 proto::local_time(p.start_ms),
             ]
         })
@@ -455,4 +585,19 @@ fn colour_stdout() -> bool {
     use std::io::IsTerminal;
     std::env::var_os("NO_COLOR").is_none()
         && (std::env::var_os("CLICOLOR_FORCE").is_some() || io::stdout().is_terminal())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ctrl_c_is_split_out_of_typed_input() {
+        assert_eq!(split_interrupts(b"ab"), [Some(b"ab".to_vec())]);
+        assert_eq!(split_interrupts(b"\x03"), [None]);
+        assert_eq!(
+            split_interrupts(b"a\x03\x03b"),
+            [Some(b"a".to_vec()), None, None, Some(b"b".to_vec())]
+        );
+    }
 }

@@ -3,16 +3,16 @@
 //! `godo watch`: a live dashboard of jobs, drawn like the C++ godo's.
 //!
 //! The header is `GODO WATCH` in green. Below it, a 30-column TARGETS pane
-//! lists every `directive target` started since watch opened (plus the
-//! daemon itself), with a status dot: green running, red failed, yellow
-//! succeeded, yellow ○ nothing yet. Beside it, the LOGS pane shows the
-//! selected target's output, wrapped and following the end.
+//! lists each `directive target` whose newest job is running or started in
+//! the last day (`--since`, `--all`), plus the daemon itself, with a status
+//! dot: green running, red failed, yellow succeeded, yellow ○ no jobs left.
+//! Beside it, the LOGS pane shows the selected target's output as a
+//! terminal would (progress bars redraw in place), following the end.
 //!
-//! Keys, as in the C++ godo: q or Esc quits. ↑/k and ↓/j move between
-//! targets, or scroll once scrolled; k scrolls whenever there are logs.
-//! PgUp and PgDn scroll 20 lines, and so does the mouse wheel, one line at
-//! a time. It redraws 30 times a second and asks the daemon for jobs every
-//! tenth frame.
+//! Keys: ↑/↓ or k/j choose a target. PgUp/PgDn, Ctrl+U/Ctrl+D, and the
+//! mouse wheel scroll the logs; g/G or Home/End jump to the top or bottom.
+//! q, Esc, or Ctrl+C quits. It redraws 30 times a second and asks the
+//! daemon for jobs every tenth frame.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -20,45 +20,26 @@ use std::time::{Duration, Instant};
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Paragraph};
-use unicode_width::UnicodeWidthChar;
+use ratatui::widgets::Paragraph;
 
 use crate::logs::Tailer;
 use crate::proto::ProcessInfo;
+use crate::tui::{self, GREEN, Key, LogView, RED, SELECTED_BG, WHITE, YELLOW};
 
 const SIDEBAR_WIDTH: u16 = 30;
 const FPS: u64 = 30;
 /// Ask the daemon for jobs every this many frames.
 const POLL_EVERY: u64 = 10;
-const PAGE: usize = 20;
-
-const BORDER: Color = Color::Indexed(240);
-const SELECTED_BG: Color = Color::Indexed(24);
-const HEADER: Color = Color::Rgb(0, 255, 128);
-const GREEN: Color = Color::Rgb(0, 255, 0);
-const RED: Color = Color::Rgb(255, 0, 0);
-const YELLOW: Color = Color::Rgb(255, 255, 0);
-const WHITE: Color = Color::Rgb(255, 255, 255);
+/// The default window: targets with a job in the last day.
+pub const DEFAULT_SINCE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Where watch gets its jobs and their logs.
 pub trait Source {
     /// Every job the daemon knows, or `None` if it can't be reached.
     fn processes(&mut self) -> Option<Vec<ProcessInfo>>;
     fn log_path(&self, id: u64) -> PathBuf;
-}
-
-pub enum Input {
-    Quit,
-    Up,
-    /// `k`: scrolls whenever there are logs, else moves up.
-    K,
-    Down,
-    PageUp,
-    PageDown,
-    WheelUp,
-    WheelDown,
 }
 
 /// What a selected target's logs were, kept while another is selected.
@@ -69,8 +50,9 @@ struct Saved {
 
 pub struct Watcher<S: Source> {
     source: S,
-    /// Jobs that started before this are left out, as in the C++ godo.
-    start_secs: u64,
+    /// Targets whose newest job started before this (ms) are left out,
+    /// unless it's still running. `None` shows everything.
+    cutoff: Option<u64>,
     tick: u64,
     processes: Vec<ProcessInfo>,
     /// Every key seen, in first-seen order, so finished targets stay.
@@ -88,10 +70,12 @@ pub struct Watcher<S: Source> {
 }
 
 impl<S: Source> Watcher<S> {
-    pub fn new(source: S) -> Self {
+    /// `since`: how far back to show targets; `None` for all of history.
+    pub fn new(source: S, since: Option<Duration>) -> Self {
+        let now = crate::proto::now_ms();
         Self {
             source,
-            start_secs: crate::proto::now_ms() / 1000,
+            cutoff: since.map(|d| now.saturating_sub(d.as_millis() as u64)),
             tick: 0,
             processes: Vec::new(),
             seen: Vec::new(),
@@ -135,24 +119,19 @@ impl<S: Source> Watcher<S> {
     }
 
     fn max_scroll(&self) -> usize {
-        self.logs.total_lines().saturating_sub(self.log_height)
+        self.logs.total_rows().saturating_sub(self.log_height)
     }
 
-    pub fn input(&mut self, input: Input) {
-        let max = self.max_scroll();
-        match input {
-            Input::Quit => self.quit = true,
-            Input::Up if self.scroll > 0 => self.scroll = (self.scroll + 1).min(max),
-            Input::K if self.scroll > 0 || !self.logs.is_empty() => {
-                self.scroll = (self.scroll + 1).min(max)
+    pub fn input(&mut self, key: Key) {
+        match key {
+            Key::Quit | Key::Back => self.quit = true,
+            Key::Up => self.select_offset(-1),
+            Key::Down => self.select_offset(1),
+            Key::Enter => {}
+            scrolling => {
+                self.scroll =
+                    tui::scroll(self.scroll, self.max_scroll(), self.log_height, scrolling)
             }
-            Input::Up | Input::K => self.select_offset(-1),
-            Input::Down | Input::WheelDown if self.scroll > 0 => self.scroll -= 1,
-            Input::Down => self.select_offset(1),
-            Input::WheelDown => {}
-            Input::WheelUp => self.scroll = (self.scroll + 1).min(max),
-            Input::PageUp => self.scroll = (self.scroll + PAGE).min(max),
-            Input::PageDown => self.scroll = self.scroll.saturating_sub(PAGE),
         }
     }
 
@@ -216,12 +195,35 @@ impl<S: Source> Watcher<S> {
         }
     }
 
+    /// Jobs in scope: the daemon, and every job of a target whose newest
+    /// job is running or started after the cutoff.
+    fn in_scope(&self, processes: Vec<ProcessInfo>) -> Vec<ProcessInfo> {
+        let Some(cutoff) = self.cutoff else {
+            return processes;
+        };
+        let mut newest: HashMap<String, &ProcessInfo> = HashMap::new();
+        for p in &processes {
+            let entry = newest.entry(p.key()).or_insert(p);
+            if p.id > entry.id {
+                *entry = p;
+            }
+        }
+        let keep: Vec<String> = newest
+            .into_iter()
+            .filter(|(_, p)| p.id == 0 || p.running || p.start_ms >= cutoff)
+            .map(|(k, _)| k)
+            .collect();
+        processes
+            .into_iter()
+            .filter(|p| keep.contains(&p.key()))
+            .collect()
+    }
+
     fn poll(&mut self) {
-        let Some(mut processes) = self.source.processes() else {
+        let Some(processes) = self.source.processes() else {
             return;
         };
-        let start = self.start_secs;
-        processes.retain(|p| p.id == 0 || p.start_ms / 1000 >= start);
+        let processes = self.in_scope(processes);
         // Read output that arrived before the job ended, then announce it.
         let selected_paths: Vec<PathBuf> = processes
             .iter()
@@ -259,24 +261,19 @@ impl<S: Source> Watcher<S> {
 
     /// Adds output, keeping a scrolled view on the same lines.
     fn append(&mut self, text: &str) {
-        let before = self.logs.total_lines();
+        let before = self.logs.total_rows();
         self.logs.push(text);
         if self.scroll > 0 {
-            self.scroll += self.logs.total_lines() - before;
+            self.scroll += self.logs.total_rows().saturating_sub(before);
         }
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
-        let header = Line::from(vec![
-            Span::styled(
-                " GODO WATCH ",
-                Style::new().fg(HEADER).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" (q to quit, arrows to navigate)"),
-        ]);
-        frame.render_widget(header, Rect { height: 1, ..area });
-
+        frame.render_widget(
+            tui::header("WATCH", "q to quit, arrows to navigate"),
+            Rect { height: 1, ..area },
+        );
         let body_height = area.height.saturating_sub(2);
         let side_width = SIDEBAR_WIDTH.min(area.width);
         let side = Rect::new(area.x, area.y + 1, side_width, body_height);
@@ -286,33 +283,48 @@ impl<S: Source> Watcher<S> {
             area.width - side_width,
             body_height,
         );
-        let pane = |title: String| {
-            Block::bordered()
-                .border_type(BorderType::Rounded)
-                .border_style(Style::new().fg(BORDER))
-                .title(Span::styled(title, Style::new().fg(BORDER)))
-        };
 
+        // The TARGETS list scrolls to keep the selection in view.
+        let keys = self.keys();
+        let rows = body_height.saturating_sub(2) as usize;
+        let at = keys.iter().position(|k| *k == self.selected).unwrap_or(0);
+        let first = if keys.len() <= rows {
+            0
+        } else {
+            at.saturating_sub(rows.saturating_sub(1) / 2)
+                .min(keys.len() - rows)
+        };
         let inner_side = side_width.saturating_sub(2) as usize;
-        let targets: Vec<Line> = self
-            .keys()
-            .into_iter()
-            .map(|key| self.target_line(&key, inner_side))
+        let targets: Vec<Line> = keys
+            .iter()
+            .skip(first)
+            .take(rows)
+            .map(|key| self.target_line(key, inner_side))
             .collect();
-        frame.render_widget(
-            Paragraph::new(targets).block(pane(" TARGETS ".into())),
-            side,
-        );
+        let mut block = tui::pane(" TARGETS ".into());
+        let more = Style::new().fg(tui::BORDER);
+        if first > 0 {
+            block = block.title(Line::styled(format!(" ▲ {first} more "), more).right_aligned());
+        }
+        let below = keys.len().saturating_sub(first + rows);
+        if below > 0 {
+            block =
+                block.title_bottom(Line::styled(format!(" ▼ {below} more "), more).right_aligned());
+        }
+        frame.render_widget(Paragraph::new(targets).block(block), side);
 
         // Like the C++ godo, logs wrap two columns short of the pane.
         self.logs.set_width(main.width.saturating_sub(4) as usize);
         self.log_height = body_height.saturating_sub(2) as usize;
         self.scroll = self.scroll.min(self.max_scroll());
-        let title = if self.selected.is_empty() {
+        let mut title = if self.selected.is_empty() {
             " LOGS ".to_string()
         } else {
             format!(" LOGS: {} ", self.selected)
         };
+        if self.scroll > 0 {
+            title.push_str(&format!("↑{} ", self.scroll));
+        }
         let content: Vec<Line> = if !self.logs.is_empty() {
             self.logs.visible(self.log_height, self.scroll)
         } else if self.selected.is_empty() {
@@ -323,7 +335,17 @@ impl<S: Source> Watcher<S> {
                 self.selected
             ))]
         };
-        frame.render_widget(Paragraph::new(content).block(pane(title)), main);
+        frame.render_widget(Paragraph::new(content).block(tui::pane(title)), main);
+
+        if area.height > 2 {
+            let footer = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
+            frame.render_widget(
+                tui::footer(
+                    "↑↓/jk target · PgUp/PgDn ^U/^D wheel scroll · g/G top/bottom · q quit",
+                ),
+                footer,
+            );
+        }
     }
 
     fn target_line(&self, key: &str, width: usize) -> Line<'static> {
@@ -352,194 +374,6 @@ impl<S: Source> Watcher<S> {
     }
 }
 
-/// Text with ANSI colours, turned into styled lines wrapped to a width as
-/// it arrives. Colours carry across lines, as in a terminal.
-#[derive(Default)]
-pub struct LogView {
-    raw: String,
-    width: usize,
-    lines: Vec<Line<'static>>,
-    spans: Vec<Span<'static>>,
-    text: String,
-    text_style: Style,
-    column: usize,
-    style: Style,
-    escape: Option<String>,
-}
-
-impl LogView {
-    pub fn raw(&self) -> &str {
-        &self.raw
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.raw.is_empty()
-    }
-
-    /// Wrapped lines, counting the line being written.
-    pub fn total_lines(&self) -> usize {
-        self.lines.len() + 1
-    }
-
-    pub fn replace(&mut self, raw: &str) {
-        let width = self.width;
-        *self = Self {
-            width,
-            ..Self::default()
-        };
-        self.push(raw);
-    }
-
-    pub fn set_width(&mut self, width: usize) {
-        if width != self.width {
-            self.width = width;
-            let raw = std::mem::take(&mut self.raw);
-            self.replace(&raw);
-        }
-    }
-
-    pub fn push(&mut self, text: &str) {
-        self.raw.push_str(text);
-        for c in text.chars() {
-            self.feed(c);
-        }
-    }
-
-    /// `height` lines ending `scroll` lines above the bottom.
-    pub fn visible(&self, height: usize, scroll: usize) -> Vec<Line<'static>> {
-        let mut all: Vec<Line<'static>> = self.lines.clone();
-        let mut current = self.spans.clone();
-        if !self.text.is_empty() {
-            current.push(Span::styled(self.text.clone(), self.text_style));
-        }
-        all.push(Line::from(current));
-        let end = all.len().saturating_sub(scroll);
-        let start = end.saturating_sub(height);
-        all.drain(start..end).collect()
-    }
-
-    fn feed(&mut self, c: char) {
-        if let Some(seq) = self.escape.as_mut() {
-            seq.push(c);
-            if escape_done(seq) {
-                let seq = self.escape.take().expect("in an escape");
-                if let Some(params) = seq.strip_prefix('[').and_then(|s| s.strip_suffix('m')) {
-                    self.style = apply_sgr(self.style, params);
-                }
-            }
-            return;
-        }
-        match c {
-            '\x1b' => self.escape = Some(String::new()),
-            '\n' => self.break_line(),
-            '\t' => {
-                let spaces = 8 - self.column % 8;
-                for _ in 0..spaces {
-                    self.put(' ', 1);
-                }
-            }
-            c if c.is_control() => {}
-            c => {
-                let w = c.width().unwrap_or(0);
-                self.put(c, w);
-            }
-        }
-    }
-
-    fn put(&mut self, c: char, w: usize) {
-        if self.width > 0 && self.column + w > self.width && self.column > 0 {
-            self.break_line();
-        }
-        if self.style != self.text_style && !self.text.is_empty() {
-            let text = std::mem::take(&mut self.text);
-            self.spans.push(Span::styled(text, self.text_style));
-        }
-        self.text_style = self.style;
-        self.text.push(c);
-        self.column += w;
-    }
-
-    fn break_line(&mut self) {
-        let mut spans = std::mem::take(&mut self.spans);
-        if !self.text.is_empty() {
-            spans.push(Span::styled(
-                std::mem::take(&mut self.text),
-                self.text_style,
-            ));
-        }
-        self.lines.push(Line::from(spans));
-        self.column = 0;
-    }
-}
-
-/// Whether an escape sequence (after the ESC) is complete: CSI ends at a
-/// final byte, OSC at BEL or ST, anything else after one character.
-fn escape_done(seq: &str) -> bool {
-    let mut chars = seq.chars();
-    match chars.next() {
-        None => false,
-        Some('[') => seq.len() > 1 && seq.chars().last().is_some_and(|c| ('@'..='~').contains(&c)),
-        Some(']') => seq.ends_with('\x07') || seq.ends_with("\x1b\\"),
-        Some(_) => true,
-    }
-}
-
-/// Applies an SGR sequence's parameters (`1;31`, `38;5;240`, ...).
-fn apply_sgr(mut style: Style, params: &str) -> Style {
-    let mut nums = params
-        .split(';')
-        .map(|p| p.parse::<u16>().unwrap_or(0))
-        .peekable();
-    if params.is_empty() {
-        return Style::default();
-    }
-    while let Some(n) = nums.next() {
-        style = match n {
-            0 => Style::default(),
-            1 => style.add_modifier(Modifier::BOLD),
-            2 => style.add_modifier(Modifier::DIM),
-            3 => style.add_modifier(Modifier::ITALIC),
-            4 => style.add_modifier(Modifier::UNDERLINED),
-            5 => style.add_modifier(Modifier::SLOW_BLINK),
-            7 => style.add_modifier(Modifier::REVERSED),
-            9 => style.add_modifier(Modifier::CROSSED_OUT),
-            21 | 22 => style.remove_modifier(Modifier::BOLD | Modifier::DIM),
-            23 => style.remove_modifier(Modifier::ITALIC),
-            24 => style.remove_modifier(Modifier::UNDERLINED),
-            25 => style.remove_modifier(Modifier::SLOW_BLINK),
-            27 => style.remove_modifier(Modifier::REVERSED),
-            29 => style.remove_modifier(Modifier::CROSSED_OUT),
-            30..=37 => style.fg(Color::Indexed((n - 30) as u8)),
-            39 => style.fg(Color::Reset),
-            40..=47 => style.bg(Color::Indexed((n - 40) as u8)),
-            49 => style.bg(Color::Reset),
-            90..=97 => style.fg(Color::Indexed((n - 90 + 8) as u8)),
-            100..=107 => style.bg(Color::Indexed((n - 100 + 8) as u8)),
-            38 | 48 => {
-                let colour = match nums.next() {
-                    Some(5) => nums.next().map(|i| Color::Indexed(i as u8)),
-                    Some(2) => {
-                        let (r, g, b) = (nums.next(), nums.next(), nums.next());
-                        Some(Color::Rgb(
-                            r.unwrap_or(0) as u8,
-                            g.unwrap_or(0) as u8,
-                            b.unwrap_or(0) as u8,
-                        ))
-                    }
-                    _ => None,
-                };
-                match (n, colour) {
-                    (38, Some(c)) => style.fg(c),
-                    (48, Some(c)) => style.bg(c),
-                    _ => style,
-                }
-            }
-            _ => style,
-        };
-    }
-    style
-}
-
 /// The daemon, through its socket and log directory.
 pub struct DaemonSource {
     home: crate::proto::Home,
@@ -557,14 +391,12 @@ impl Source for DaemonSource {
 }
 
 /// Runs the dashboard until q, starting the daemon if it isn't running.
-pub fn run(home: crate::proto::Home) -> clapsmith::Result {
-    use ratatui::crossterm::event::{
-        self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
-    };
+pub fn run(home: crate::proto::Home, since: Option<Duration>) -> clapsmith::Result {
+    use ratatui::crossterm::event;
 
     crate::client::connect_or_start(&home)?;
-    let mut watcher = Watcher::new(DaemonSource { home });
-    let mut terminal = Screen::enter()?;
+    let mut watcher = Watcher::new(DaemonSource { home }, since);
+    let mut screen = tui::Screen::enter()?;
     let frame_time = Duration::from_millis(1000 / FPS);
     let mut next_tick = Instant::now();
     while !watcher.quit {
@@ -575,83 +407,43 @@ pub fn run(home: crate::proto::Home) -> clapsmith::Result {
                 next_tick = Instant::now() + frame_time;
             }
         }
-        terminal.0.draw(|f| watcher.draw(f))?;
+        screen.0.draw(|f| watcher.draw(f))?;
         let wait = next_tick.saturating_duration_since(Instant::now());
         if !event::poll(wait)? {
             continue;
         }
-        let input = match event::read()? {
-            Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => Some(Input::Quit),
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    Some(Input::Quit)
-                }
-                KeyCode::Up => Some(Input::Up),
-                KeyCode::Char('k') => Some(Input::K),
-                KeyCode::Down | KeyCode::Char('j') => Some(Input::Down),
-                KeyCode::PageUp => Some(Input::PageUp),
-                KeyCode::PageDown => Some(Input::PageDown),
-                _ => None,
-            },
-            Event::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::ScrollUp => Some(Input::WheelUp),
-                MouseEventKind::ScrollDown => Some(Input::WheelDown),
-                _ => None,
-            },
-            _ => None,
-        };
-        if let Some(input) = input {
-            watcher.input(input);
+        if let Some(key) = tui::key(&event::read()?) {
+            watcher.input(key);
         }
     }
     Ok(std::process::ExitCode::SUCCESS)
 }
 
-type Backend = ratatui::backend::CrosstermBackend<std::io::Stdout>;
-
-/// The alternate screen in raw mode with mouse reporting, put back as it
-/// was when dropped, even on panic.
-struct Screen(ratatui::Terminal<Backend>);
-
-impl Screen {
-    fn enter() -> std::io::Result<Self> {
-        use ratatui::crossterm::{event::EnableMouseCapture, execute, terminal};
-        terminal::enable_raw_mode()?;
-        let mut stdout = std::io::stdout();
-        execute!(stdout, terminal::EnterAlternateScreen, EnableMouseCapture)?;
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            Self::restore();
-            previous(info);
-        }));
-        let mut term = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(stdout))?;
-        term.hide_cursor()?;
-        Ok(Self(term))
-    }
-
-    fn restore() {
-        use ratatui::crossterm::{event::DisableMouseCapture, execute, terminal};
-        let _ = terminal::disable_raw_mode();
-        let _ = execute!(
-            std::io::stdout(),
-            DisableMouseCapture,
-            terminal::LeaveAlternateScreen,
-            ratatui::crossterm::cursor::Show
-        );
-    }
-}
-
-impl Drop for Screen {
-    fn drop(&mut self) {
-        Self::restore();
-    }
+/// Parses `90s`, `30m`, `2h`, `7d`, or a bare number of seconds.
+pub fn parse_duration(text: &str) -> Result<Duration, String> {
+    let text = text.trim();
+    let (number, unit) = text
+        .find(|c: char| !c.is_ascii_digit())
+        .map_or((text, "s"), |i| text.split_at(i));
+    let bad = || format!("`{text}` isn't a duration; try 30m, 2h, or 7d");
+    let n: u64 = number.parse().map_err(|_| bad())?;
+    let secs = match unit {
+        "s" => n,
+        "m" => n * 60,
+        "h" => n * 3600,
+        "d" => n * 86_400,
+        _ => return Err(bad()),
+    };
+    Ok(Duration::from_secs(secs))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::{BORDER, HEADER};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Modifier;
 
     struct Fake {
         processes: Vec<ProcessInfo>,
@@ -682,14 +474,14 @@ mod tests {
             directive: directive.into(),
             running,
             exit_code: code,
-            start_ms: crate::proto::now_ms() + 5_000,
+            start_ms: crate::proto::now_ms(),
             end_ms: None,
         }
     }
 
     fn fake(test: &str, processes: Vec<ProcessInfo>) -> Watcher<Fake> {
         let dir = crate::testdir::TestDir::new(&format!("watch-{test}"));
-        Watcher::new(Fake { processes, dir })
+        Watcher::new(Fake { processes, dir }, Some(DEFAULT_SINCE))
     }
 
     fn log(w: &Watcher<Fake>, id: u64, text: &str) {
@@ -718,7 +510,7 @@ mod tests {
         assert!(buf[(1, 0)].modifier.contains(Modifier::BOLD));
         assert!(row(&buf, 1).starts_with("╭ TARGETS ─"), "{}", row(&buf, 1));
         assert!(
-            row(&buf, 1)[..].contains("╭ LOGS: build web ─"),
+            row(&buf, 1).contains("╭ LOGS: build web ─"),
             "{}",
             row(&buf, 1)
         );
@@ -732,18 +524,17 @@ mod tests {
         assert_eq!(buf[(4, 2)].fg, GREEN);
         assert_eq!(buf[(6, 2)].fg, WHITE);
         assert_eq!(buf[(28, 2)].bg, SELECTED_BG);
-        // The sidebar is 30 columns; the last row is left blank.
         assert_eq!(buf[(29, 2)].symbol(), "│");
         assert_eq!(buf[(30, 1)].symbol(), "╭");
-        assert!(row(&buf, 11).trim().is_empty());
         assert!(row(&buf, 10).starts_with("╰"));
-        // Short logs start at the top, as in the C++ godo; long ones follow
-        // the end (see scrolling_moves_through_logs_and_back).
+        // Short logs start at the top, as in the C++ godo.
         assert!(
             row(&buf, 2).contains("│compiling"),
             "{}",
             row(&buf, 2).trim()
         );
+        // The bottom row lists the keys.
+        assert!(row(&buf, 11).contains("q quit"), "{}", row(&buf, 11));
     }
 
     #[test]
@@ -751,7 +542,6 @@ mod tests {
         let mut w = fake("wide", vec![job(1, "构建", "网站", true, None)]);
         w.tick();
         let buf = screen(&mut w, 60, 6);
-        // The highlight still ends at the pane's edge and the border stays put.
         assert_eq!(buf[(28, 2)].bg, SELECTED_BG, "{}", row(&buf, 2));
         assert_eq!(buf[(29, 2)].symbol(), "│", "{}", row(&buf, 2));
         // ratatui clips at the border anyway, so check the line itself.
@@ -791,34 +581,54 @@ mod tests {
     }
 
     #[test]
-    fn jobs_from_before_watch_opened_are_left_out() {
+    fn scope_is_recent_or_running_targets() {
+        let day = 24 * 3600 * 1000;
         let mut old = job(1, "build", "old", false, Some(0));
-        old.start_ms = 1_000;
+        old.start_ms -= 2 * day;
+        let mut old_running = job(2, "dev", "server", true, None);
+        old_running.start_ms -= 2 * day;
+        // A target counts if its newest job is recent, even with old ones.
+        let mut web_old = job(3, "test", "web", false, Some(0));
+        web_old.start_ms -= 2 * day;
+        let web_new = job(4, "test", "web", false, Some(0));
         let mut daemon = job(0, "system", "daemon", true, None);
-        daemon.start_ms = 1_000;
-        let mut w = fake("filter", vec![daemon, old]);
+        daemon.start_ms -= 2 * day;
+        let all = vec![daemon, old, old_running, web_old, web_new];
+        let mut w = fake("scope", all.clone());
         w.tick();
-        assert_eq!(w.keys(), ["system daemon"]);
+        assert_eq!(w.keys(), ["system daemon", "dev server", "test web"]);
+        assert_eq!(w.group("test web").len(), 2, "with all of its jobs");
+        let mut everything = Watcher::new(
+            Fake {
+                processes: all,
+                dir: crate::testdir::TestDir::new("watch-scope-all"),
+            },
+            None,
+        );
+        everything.tick();
+        assert_eq!(everything.keys().len(), 4);
     }
 
     #[test]
-    fn arrows_move_between_targets_and_wrap() {
+    fn arrows_and_jk_choose_targets_and_wrap() {
         let mut w = fake(
             "nav",
             vec![job(1, "a", "x", true, None), job(2, "b", "y", true, None)],
         );
+        log(&w, 1, "some logs\n");
         w.tick();
         assert_eq!(w.selected, "a x");
-        w.input(Input::Down);
+        w.input(Key::Down);
         assert_eq!(w.selected, "b y");
-        w.input(Input::Down);
+        w.input(Key::Down);
         assert_eq!(w.selected, "a x", "wraps to the top");
-        w.input(Input::Up);
-        assert_eq!(w.selected, "b y", "wraps to the bottom");
+        w.input(Key::Up);
+        assert_eq!(w.selected, "b y", "wraps to the bottom; k/↑ never scroll");
+        assert_eq!(w.scroll, 0);
     }
 
     #[test]
-    fn scrolling_moves_through_logs_and_back() {
+    fn scroll_keys_move_through_logs() {
         let mut w = fake("scroll", vec![job(1, "a", "x", true, None)]);
         log(
             &w,
@@ -827,23 +637,46 @@ mod tests {
         );
         w.tick();
         let _ = screen(&mut w, 60, 12);
-        w.input(Input::K);
-        assert_eq!(w.scroll, 1, "k scrolls when there are logs");
-        w.input(Input::Up);
-        assert_eq!(w.scroll, 2, "up scrolls once scrolled");
-        w.input(Input::PageUp);
-        assert_eq!(w.scroll, 22);
+        w.input(Key::PageUp);
+        assert_eq!(w.scroll, 8, "a page is the pane's height");
+        w.input(Key::HalfDown);
+        assert_eq!(w.scroll, 4);
+        w.input(Key::Top);
         let buf = screen(&mut w, 60, 12);
-        assert!(row(&buf, 2).contains("line 21"), "{}", row(&buf, 2));
-        w.input(Input::PageDown);
-        w.input(Input::Down);
-        w.input(Input::Down);
+        assert!(row(&buf, 2).contains("line 0"), "{}", row(&buf, 2));
+        assert!(
+            row(&buf, 1).contains("↑"),
+            "the title shows how far up: {}",
+            row(&buf, 1)
+        );
+        w.input(Key::Bottom);
         assert_eq!(w.scroll, 0);
-        assert_eq!(w.selected, "a x", "down only scrolls until the bottom");
-        w.input(Input::PageUp);
-        w.input(Input::PageUp);
-        w.input(Input::PageUp);
-        assert!(w.scroll <= w.max_scroll(), "can't scroll past the top");
+        w.input(Key::WheelUp);
+        assert_eq!(w.scroll, 3);
+        assert_eq!(w.selected, "a x");
+    }
+
+    #[test]
+    fn a_long_target_list_scrolls_with_the_selection() {
+        let jobs: Vec<ProcessInfo> = (1..=20)
+            .map(|i| job(i, "build", &format!("t{i:02}"), true, None))
+            .collect();
+        let mut w = fake("longlist", jobs);
+        w.tick();
+        let buf = screen(&mut w, 60, 10);
+        // 6 rows fit; the rest are counted below.
+        assert!(row(&buf, 8).contains("▼ 14 more"), "{}", row(&buf, 8));
+        for _ in 0..12 {
+            w.input(Key::Down);
+        }
+        let buf = screen(&mut w, 60, 10);
+        let shown: String = (2..8).map(|y| row(&buf, y)).collect();
+        assert!(
+            shown.contains("> ") && shown.contains("build t13"),
+            "{shown}"
+        );
+        assert!(row(&buf, 1).contains("▲"), "{}", row(&buf, 1));
+        assert!(row(&buf, 8).contains("▼"), "{}", row(&buf, 8));
     }
 
     #[test]
@@ -875,11 +708,21 @@ mod tests {
         );
         log(&w, 1, "from x\n");
         w.tick();
-        w.input(Input::Down);
+        w.input(Key::Down);
         log(&w, 1, "more x\n");
-        w.input(Input::Down);
+        w.input(Key::Down);
         w.tick();
         assert_eq!(w.logs.raw(), "from x\nmore x\n");
+    }
+
+    #[test]
+    fn progress_bars_redraw_in_place() {
+        let mut w = fake("progress", vec![job(1, "a", "x", true, None)]);
+        log(&w, 1, "Building\n[=  ] 33%\r[== ] 66%\r[===] 100%\n");
+        w.tick();
+        let buf = screen(&mut w, 60, 8);
+        assert!(row(&buf, 3).contains("[===] 100%"), "{}", row(&buf, 3));
+        assert!(!(2..6).any(|y| row(&buf, y).contains("33%")));
     }
 
     #[test]
@@ -898,39 +741,12 @@ mod tests {
     }
 
     #[test]
-    fn log_view_wraps_and_keeps_colours_across_lines() {
-        let mut v = LogView::default();
-        v.set_width(5);
-        v.push("\x1b[31mabcdefg\nhi\x1b[0m!");
-        let lines = v.visible(10, 0);
-        let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
-        assert_eq!(text, ["abcde", "fg", "hi!"]);
-        assert_eq!(lines[1].spans[0].style.fg, Some(Color::Indexed(1)));
-        assert_eq!(
-            lines[2].spans[0].style.fg,
-            Some(Color::Indexed(1)),
-            "red carries on"
-        );
-        assert_eq!(lines[2].spans[1].style.fg, None, "reset");
-    }
-
-    #[test]
-    fn log_view_rewraps_on_resize_and_drops_other_escapes() {
-        let mut v = LogView::default();
-        v.set_width(3);
-        v.push("ab\x1b[2Kcdef\x1b]0;title\x07\n");
-        assert_eq!(v.total_lines(), 3);
-        v.set_width(10);
-        let text: Vec<String> = v.visible(10, 0).iter().map(|l| l.to_string()).collect();
-        assert_eq!(text, ["abcdef", ""]);
-    }
-
-    #[test]
-    fn sgr_parses_256_and_truecolour() {
-        let s = apply_sgr(Style::default(), "1;38;5;240;48;2;1;2;3");
-        assert_eq!(s.fg, Some(Color::Indexed(240)));
-        assert_eq!(s.bg, Some(Color::Rgb(1, 2, 3)));
-        assert!(s.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(apply_sgr(s, ""), Style::default());
+    fn durations_parse() {
+        assert_eq!(parse_duration("90").unwrap(), Duration::from_secs(90));
+        assert_eq!(parse_duration("30m").unwrap(), Duration::from_secs(1800));
+        assert_eq!(parse_duration("2h").unwrap(), Duration::from_secs(7200));
+        assert_eq!(parse_duration("7d").unwrap(), Duration::from_secs(604_800));
+        assert!(parse_duration("soon").is_err());
+        assert!(parse_duration("5y").is_err());
     }
 }

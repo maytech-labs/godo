@@ -9,10 +9,15 @@
 //!
 //! A job's output is written to its log and sent to its clients under one
 //! lock, and attaching reads the log and joins the clients under the same
-//! lock, so an attached client sees everything exactly once.
+//! lock, so an attached client sees everything exactly once. Output is
+//! kept as the job wrote it, `\r` and all, for terminals to draw.
+//!
+//! Clients following a job can type into it and resize it: they send
+//! [`ClientMsg`]s on the same connection. With several attached, all can
+//! type, and the latest resize wins.
 
 use std::collections::BTreeMap;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -20,7 +25,7 @@ use std::time::Duration;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 use crate::logs::LogWriter;
-use crate::proto::{self, Event, Home, PROTOCOL, ProcessInfo, RawEnvelope, Request};
+use crate::proto::{self, ClientMsg, Event, Home, PROTOCOL, ProcessInfo, RawEnvelope, Request};
 
 /// How long a client may stall a write before it's dropped.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -43,6 +48,8 @@ struct Job {
     log: Option<LogWriter>,
     /// Kept for the job's lifetime; closing it hangs up the terminal.
     master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+    /// Where clients' keystrokes go.
+    input: Option<Box<dyn Write + Send>>,
 }
 
 struct State {
@@ -273,6 +280,10 @@ impl Daemon {
             Ok(reader) => reader,
             Err(e) => return Err((stream, format!("can't read the terminal: {e}"))),
         };
+        let input = match pair.master.take_writer() {
+            Ok(input) => input,
+            Err(e) => return Err((stream, format!("can't write to the terminal: {e}"))),
+        };
 
         let mut state = self.lock();
         let id = state.next_id;
@@ -291,6 +302,7 @@ impl Daemon {
         // If the client left already, the job still runs, as if detached.
         let mut clients = Vec::new();
         if proto::write(&mut stream, &Event::Started { id }).is_ok() {
+            self.listen_to(id, &stream);
             clients.push(stream);
         }
         let info = ProcessInfo {
@@ -311,6 +323,7 @@ impl Daemon {
                 clients,
                 log: Some(log),
                 master: Some(pair.master),
+                input: Some(input),
             },
         );
         self.save_history(&state);
@@ -347,7 +360,7 @@ impl Daemon {
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
-            let text = normalize_newlines(&chunker.push(&buf[..n]));
+            let text = chunker.push(&buf[..n]);
             if text.is_empty() {
                 continue;
             }
@@ -375,6 +388,7 @@ impl Daemon {
         job.info.exit_code = Some(code);
         job.info.end_ms = Some(proto::now_ms());
         job.master = None;
+        job.input = None;
         job.log = None;
         broadcast(&mut job.clients, &Event::Exit { code });
         job.clients.clear();
@@ -382,7 +396,7 @@ impl Daemon {
         self.save_history(&state);
     }
 
-    fn attach(&self, id: u64, mut stream: UnixStream) {
+    fn attach(self: &Arc<Self>, id: u64, mut stream: UnixStream) {
         let mut state = self.lock();
         let Some(job) = state.jobs.get_mut(&id) else {
             drop(state);
@@ -407,11 +421,46 @@ impl Daemon {
             return;
         }
         if job.info.running {
+            self.listen_to(id, &stream);
             job.clients.push(stream);
         } else {
             let code = job.info.exit_code.unwrap_or(-1);
             let _ = proto::write(&mut stream, &Event::Exit { code });
         }
+    }
+
+    /// Reads a following client's keystrokes and resizes until it leaves.
+    fn listen_to(self: &Arc<Self>, id: u64, stream: &UnixStream) {
+        let Ok(mut stream) = stream.try_clone() else {
+            return;
+        };
+        let daemon = Arc::clone(self);
+        std::thread::spawn(move || {
+            while let Ok(Some(msg)) = proto::read::<ClientMsg>(&mut stream) {
+                let mut state = daemon.lock();
+                let Some(job) = state.jobs.get_mut(&id).filter(|j| j.info.running) else {
+                    return;
+                };
+                match msg {
+                    ClientMsg::Input { data } => {
+                        if let Some(input) = job.input.as_mut() {
+                            let _ = input.write_all(&data);
+                            let _ = input.flush();
+                        }
+                    }
+                    ClientMsg::Resize { cols, rows } => {
+                        if let Some(master) = job.master.as_ref() {
+                            let _ = master.resize(PtySize {
+                                rows: rows.max(1),
+                                cols: cols.max(1),
+                                pixel_width: 0,
+                                pixel_height: 0,
+                            });
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// SIGTERM to the job's process group, then SIGKILL if it's still
@@ -528,6 +577,7 @@ fn load_history(home: &Home) -> BTreeMap<u64, Job> {
                 clients: Vec::new(),
                 log: None,
                 master: None,
+                input: None,
             };
             (job.info.id, job)
         })
@@ -560,11 +610,6 @@ fn trim_log(path: &std::path::Path, limit: u64, keep: usize) {
 /// Sends `event` to every client, dropping the ones that are gone.
 fn broadcast(clients: &mut Vec<UnixStream>, event: &Event) {
     clients.retain_mut(|client| proto::write(client, event).is_ok());
-}
-
-/// As the C++ godo did: `\r\n` and lone `\r` both become `\n`.
-fn normalize_newlines(text: &str) -> String {
-    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 fn signal_group(pid: u32, signal: libc::c_int) {
@@ -611,11 +656,6 @@ fn signal_number(name: Option<&str>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn carriage_returns_become_newlines() {
-        assert_eq!(normalize_newlines("a\r\nb\rc\n"), "a\nb\nc\n");
-    }
 
     #[test]
     fn signal_numbers_from_either_platforms_wording() {
