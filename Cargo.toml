@@ -1,0 +1,15 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.98"
+license-file = "LICENSE.md"
+repository = "https://github.com/maytech-labs/godo"
+authors = ["maytech-labs"]
+
+[workspace.dependencies]
+clapsmith = { path = "crates/clapsmith", version = "0.0.1" }
+clapsmith-derive = { path = "crates/clapsmith-derive", version = "=0.0.1" }
+clap = { version = "4.6.7", features = ["derive"] }

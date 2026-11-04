@@ -1,0 +1,25 @@
+[package]
+name = "clapsmith"
+version = "0.0.1"
+description = "A companion to clap: typed dispatch to command handlers, interactive mode, styled output"
+homepage = "https://github.com/maytech-labs/godo/tree/main/crates/clapsmith"
+documentation = "https://docs.rs/clapsmith"
+readme = "README.md"
+keywords = ["cli", "clap", "interactive", "dispatch"]
+categories = ["command-line-interface"]
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = ["derive"]
+derive = ["dep:clapsmith-derive"]
+
+[dependencies]
+clap.workspace = true
+clapsmith-derive = { workspace = true, optional = true }
+
+[dev-dependencies]
+trybuild = "1.0.122"

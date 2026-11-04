@@ -1,0 +1,21 @@
+[package]
+name = "godo-cli"
+version = "0.0.1"
+description = "make, but every run is a detachable, logged, watchable job"
+homepage = "https://github.com/maytech-labs/godo/tree/main/crates/godo"
+readme = "README.md"
+keywords = ["make", "task-runner", "build", "monorepo", "cli"]
+categories = ["command-line-utilities", "development-tools::build-utils"]
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "godo"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+clapsmith.workspace = true

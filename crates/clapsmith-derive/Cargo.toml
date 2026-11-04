@@ -1,0 +1,22 @@
+[package]
+name = "clapsmith-derive"
+version = "0.0.1"
+description = "Derive macros for clapsmith. Use through the clapsmith crate."
+homepage = "https://github.com/maytech-labs/godo/tree/main/crates/clapsmith-derive"
+documentation = "https://docs.rs/clapsmith-derive"
+readme = "README.md"
+keywords = ["cli", "clap", "derive"]
+categories = ["command-line-interface"]
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "3", features = ["full"] }

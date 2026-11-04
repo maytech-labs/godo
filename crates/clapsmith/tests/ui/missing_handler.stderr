@@ -1,0 +1,32 @@
+error[E0277]: the trait bound `Clean: Handler<()>` is not satisfied
+  --> tests/ui/missing_handler.rs:27:23
+   |
+27 |     clapsmith::main::<Cli, _>(&mut ())
+   |                       ^^^ unsatisfied trait bound
+   |
+help: the trait `Handler<()>` is not implemented for `Clean`
+  --> tests/ui/missing_handler.rs:17:1
+   |
+17 | struct Clean;
+   | ^^^^^^^^^^^^
+help: the trait `Handler<()>` is implemented for `Build`
+  --> tests/ui/missing_handler.rs:19:1
+   |
+19 | impl Handler<()> for Build {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: required for `Cli` to implement `Handler<()>`
+  --> tests/ui/missing_handler.rs:8:6
+   |
+ 7 | #[derive(Parser, Dispatch)]
+   |                  -------- type parameter would need to implement `Handler<()>`
+ 8 | enum Cli {
+   |      ^^^
+   = help: consider manually implementing `Handler<()>` to avoid undesired bounds
+note: required by a bound in `clapsmith::main`
+  --> src/lib.rs
+   |
+   | pub fn main<C, Ctx>(ctx: &mut Ctx) -> ExitCode
+   |        ---- required by a bound in this function
+   | where
+   |     C: Parser + Handler<Ctx>,
+   |                 ^^^^^^^^^^^^ required by this bound in `main`
