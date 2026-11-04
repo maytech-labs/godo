@@ -1,6 +1,6 @@
 [package]
 name = "godo-cli"
-version = "0.1.1"
+version = "0.2.0"
 description = "make, but every run is a detachable, logged, watchable job"
 homepage = "https://github.com/maytech-labs/godo/tree/main/crates/godo"
 readme = "README.md"

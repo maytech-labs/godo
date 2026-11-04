@@ -4,6 +4,8 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ## Unreleased
 
+## 0.2.0 - 2026-11-04
+
 ### Added
 
 - **`godo watch`**: the live dashboard from the C++ godo, ported to ratatui with the same layout and colours. A TARGETS pane lists each `directive target` whose newest job is running or started in the last day (`--since 2h`, `--all`), plus the daemon, with a status dot (green running, red failed, yellow succeeded, yellow ○ no jobs left); it scrolls with the selection and shows `▲/▼ N more`. The LOGS pane follows the selected target and draws output as a terminal would, so progress bars update in place. ↑↓/jk choose a target; PgUp/PgDn, Ctrl+U/Ctrl+D, and the wheel scroll; g/G jump to the top or bottom; q, Esc, or Ctrl+C quits. A footer lists the keys.
