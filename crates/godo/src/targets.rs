@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: LicenseRef-REAL-1.0
 
 //! Running a directive in a target (`godo build web`) and listing targets.
+//!
+//! In a terminal, runs go through the daemon, so they can be detached,
+//! attached to, and watched. Elsewhere (CI, pipes, `GODO_DAEMON=0`) make
+//! runs in the foreground.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -10,8 +14,7 @@ use crate::config::Config;
 
 /// `godo <directive> <target> [make args...]` runs
 /// `make -C <target dir> <directive> [make args...]` with `GODO_ROOT` set to
-/// the root. For now make runs in the foreground with godo's terminal; the
-/// daemon comes later.
+/// the root, through the daemon in a terminal and in the foreground elsewhere.
 pub fn run(config: &Config, words: &[OsString], verbose: bool) -> clapsmith::Result {
     let [directive, target, extra @ ..] = words else {
         return Err(match words.first() {
@@ -29,27 +32,28 @@ pub fn run(config: &Config, words: &[OsString], verbose: bool) -> clapsmith::Res
         return Err(unknown_target(config, &name).into());
     };
     let dir = config.dir(target);
-    let mut make = Command::new("make");
     // GNU make announces "Entering directory" for -C; that's noise here.
-    make.arg("--no-print-directory")
-        .arg("-C")
-        .arg(&dir)
-        .arg(directive)
-        .args(extra)
-        .env("GODO_ROOT", &config.root);
+    let mut argv: Vec<String> = vec!["make".into(), "--no-print-directory".into(), "-C".into()];
+    argv.push(dir.to_string_lossy().into_owned());
+    argv.push(directive.to_string_lossy().into_owned());
+    argv.extend(extra.iter().map(|a| a.to_string_lossy().into_owned()));
     if verbose {
         eprintln!(
-            "godo: make --no-print-directory -C {} {}{} (GODO_ROOT={}, from {})",
-            dir.display(),
-            directive.to_string_lossy(),
-            extra
-                .iter()
-                .map(|a| format!(" {}", a.to_string_lossy()))
-                .collect::<String>(),
+            "godo: {} (GODO_ROOT={}, from {})",
+            argv.join(" "),
             config.root.display(),
             display(&config.file, &config.root),
         );
     }
+    if crate::client::use_daemon() {
+        let home = crate::proto::Home::resolve()?;
+        return crate::client::run(
+            &home,
+            job(argv, config, &name, &directive.to_string_lossy())?,
+        );
+    }
+    let mut make = Command::new("make");
+    make.args(&argv[1..]).env("GODO_ROOT", &config.root);
     let status = make
         .status()
         .map_err(|error| format!("can't run make: {error}"))?;
@@ -69,6 +73,28 @@ pub(crate) fn unknown_target(config: &Config, name: &str) -> String {
     }
     message.push_str(" Run `godo list` to see them all.");
     message
+}
+
+/// A daemon job running `argv` here, with this environment plus `GODO_ROOT`.
+fn job(
+    argv: Vec<String>,
+    config: &Config,
+    target: &str,
+    directive: &str,
+) -> clapsmith::Result<crate::client::Job> {
+    let mut env: Vec<(String, String)> =
+        std::env::vars().filter(|(k, _)| k != "GODO_ROOT").collect();
+    env.push((
+        "GODO_ROOT".into(),
+        config.root.to_string_lossy().into_owned(),
+    ));
+    Ok(crate::client::Job {
+        argv,
+        cwd: std::env::current_dir()?,
+        env,
+        target: target.to_string(),
+        directive: directive.to_string(),
+    })
 }
 
 /// make's exit code, or 128 + signal if it was killed, like a shell.

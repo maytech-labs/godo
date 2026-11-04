@@ -4,12 +4,17 @@
 //!
 //! The command tree matches the C++ godo. Working so far: running a
 //! directive in a target (`godo build web`), the registry commands (`init`,
-//! `list`, `register`, `unregister`, `scaff`, `migrate`), and `version`. The
-//! daemon commands say they aren't ported yet.
+//! `list`, `register`, `unregister`, `scaff`, `migrate`), the daemon (`run`,
+//! `ps`, `attach`, `stop`, `restart`, `history`), `watch`, and `version`.
 
+mod client;
 mod config;
+mod daemon;
+mod logs;
+mod proto;
 mod registry;
 mod targets;
+mod watch;
 
 use std::ffi::OsString;
 use std::process::ExitCode;
@@ -107,6 +112,9 @@ enum Godo {
     History(History),
     /// Attach to a running process in the daemon.
     Attach(Attach),
+    /// Run the godo daemon in the foreground (started automatically).
+    #[command(hide = true)]
+    Daemon(DaemonCmd),
     /// Print the version.
     Version(Version),
     /// `godo <directive> <target>`: anything that isn't a command above.
@@ -251,6 +259,80 @@ struct Attach {
 }
 
 #[derive(Args)]
+struct DaemonCmd;
+
+impl Handler<Ctx> for DaemonCmd {
+    fn run(self, _: &mut Ctx) -> clapsmith::Result {
+        daemon::run(proto::Home::resolve()?)?;
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
+impl Handler<Ctx> for Ps {
+    fn run(self, _: &mut Ctx) -> clapsmith::Result {
+        client::ps(&proto::Home::resolve()?)
+    }
+}
+
+impl Handler<Ctx> for Stop {
+    fn run(self, _: &mut Ctx) -> clapsmith::Result {
+        client::stop(&proto::Home::resolve()?)
+    }
+}
+
+impl Handler<Ctx> for Restart {
+    fn run(self, _: &mut Ctx) -> clapsmith::Result {
+        client::restart(&proto::Home::resolve()?)
+    }
+}
+
+impl Handler<Ctx> for Watch {
+    fn run(self, _: &mut Ctx) -> clapsmith::Result {
+        watch::run(proto::Home::resolve()?)
+    }
+}
+
+impl Handler<Ctx> for History {
+    fn run(self, _: &mut Ctx) -> clapsmith::Result {
+        let home = proto::Home::resolve()?;
+        if self.clear {
+            client::history_clear(&home)
+        } else {
+            client::history(&home)
+        }
+    }
+}
+
+impl Handler<Ctx> for Attach {
+    fn run(self, _: &mut Ctx) -> clapsmith::Result {
+        client::attach(&proto::Home::resolve()?, &self.id)
+    }
+}
+
+impl Handler<Ctx> for Run {
+    fn run(self, _: &mut Ctx) -> clapsmith::Result {
+        let argv = vec!["sh".to_string(), "-c".to_string(), self.command];
+        if !client::use_daemon() {
+            let status = std::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .status()
+                .map_err(|e| format!("can't run sh: {e}"))?;
+            return Ok(ExitCode::from(
+                u8::try_from(status.code().unwrap_or(1)).unwrap_or(1),
+            ));
+        }
+        let job = client::Job {
+            argv,
+            cwd: std::env::current_dir()?,
+            env: std::env::vars().collect(),
+            target: self.target,
+            directive: self.directive,
+        };
+        client::run(&proto::Home::resolve()?, job)
+    }
+}
+
+#[derive(Args)]
 struct Version;
 
 impl Handler<Ctx> for Version {
@@ -258,22 +340,6 @@ impl Handler<Ctx> for Version {
         println!("godo {}", env!("CARGO_PKG_VERSION"));
         Ok(ExitCode::SUCCESS)
     }
-}
-
-/// Commands that exist in the C++ godo but aren't ported yet.
-macro_rules! not_ported {
-    ($($command:ident => $name:literal),* $(,)?) => {$(
-        impl Handler<Ctx> for $command {
-            fn run(self, _: &mut Ctx) -> clapsmith::Result {
-                Err(concat!("`godo ", $name, "` isn't ported to Rust yet").into())
-            }
-        }
-    )*};
-}
-
-not_ported! {
-    Ps => "ps", Stop => "stop", Restart => "restart",
-    Run => "run", Watch => "watch", History => "history", Attach => "attach",
 }
 
 fn main() -> ExitCode {

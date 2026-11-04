@@ -10,7 +10,7 @@ brew install --HEAD maytech-labs/tap/godo    # builds main
 cargo install --git https://github.com/maytech-labs/godo godo-cli
 ```
 
-**Status:** early. Running targets and managing the registry work; jobs run in the foreground for now.
+**Status:** early, and at parity with the C++ godo's targets, jobs, and dashboard.
 
 ```sh
 godo init                       # start a project: writes godo.toml
@@ -20,10 +20,14 @@ godo list                       # registered targets
 godo list -n web                # web's Makefile targets and their ## descriptions
 godo build web                  # make -C web build, from anywhere in the project
 godo migrate                    # convert the C++ godo's .godo/config to godo.toml
+godo watch                      # live dashboard of every job
+godo ps                         # running jobs
+godo attach -i 3                # follow job 3; Ctrl+C detaches, twice kills
+godo history                    # every job, newest first
 ```
 
-godo is being ported to Rust from a C++ tool. Planned, in order:
+In a terminal, runs go to a background daemon in a pseudo-terminal: Ctrl+C detaches and leaves the job running, Ctrl+C twice kills it and everything it started. In CI and pipes they run in the foreground with make's exit code. `GODO_DAEMON=1` or `0` overrides that.
 
-1. **Jobs.** Every run goes to a per-user daemon in a PTY. Ctrl+C detaches, `godo attach` reattaches, and logs and history are kept.
-2. **`godo watch`.** A live dashboard of every running job.
-3. **Agents.** `godo mcp` lets coding agents start builds, follow logs, and read exit codes without holding a terminal.
+godo was ported to Rust from a C++ tool. Planned next:
+
+1. **Agents.** `godo mcp` lets coding agents start builds, follow logs, and read exit codes without holding a terminal.
