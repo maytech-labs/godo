@@ -4,6 +4,8 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ## Unreleased
 
+## 0.1.0 - 2026-11-04
+
 ### Added
 
 - `godo <directive> <target> [make args]` runs `make -C <target> <directive>` with `GODO_ROOT` set, in the foreground. Exit codes are make's; make runs with `--no-print-directory`. Unknown targets get suggestions.
