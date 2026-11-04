@@ -1,5 +1,7 @@
 # godo
 
+[![License: REAL 1.0](https://img.shields.io/badge/License-REAL_1.0-blue.svg)](LICENSE.md)
+
 Source-available under the [Reciprocal Ethical AI License (REAL) 1.0](LICENSE.md).
 
 This repository holds two projects that are developed together:
@@ -10,7 +12,7 @@ This repository holds two projects that are developed together:
 | [`clapsmith`](crates/clapsmith) | A companion to [clap]: typed dispatch to command handlers, interactive mode, styled output. Usable without godo. | [README](crates/clapsmith/README.md), [docs.rs](https://docs.rs/clapsmith) |
 | [`clapsmith-derive`](crates/clapsmith-derive) | clapsmith's derive macros. Use through `clapsmith`. | |
 
-**Status:** 0.0.1, early. The plan is in the godo README.
+**Status:** godo 0.1.1 runs Makefile targets from anywhere in a project and manages its target registry, with prebuilt binaries on the [releases page](https://github.com/maytech-labs/godo/releases) and in the Homebrew tap. Detachable jobs come next; the plan is in the [godo README](crates/godo/README.md).
 
 Only interested in clapsmith? Work in `crates/clapsmith`, run `cargo test -p clapsmith`, and filter issues by the `crate:clapsmith` label. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
