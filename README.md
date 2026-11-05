@@ -12,7 +12,7 @@ This repository holds two projects that are developed together:
 | [`clapsmith`](crates/clapsmith) | A companion to [clap]: typed dispatch to command handlers, interactive mode, styled output. Usable without godo. | [README](crates/clapsmith/README.md), [docs.rs](https://docs.rs/clapsmith) |
 | [`clapsmith-derive`](crates/clapsmith-derive) | clapsmith's derive macros. Use through `clapsmith`. | |
 
-**Status:** godo 0.2.0 runs Makefile targets from anywhere in a project as detachable, logged jobs, with a live dashboard (`godo watch`), with prebuilt binaries on the [releases page](https://github.com/maytech-labs/godo/releases) and in the Homebrew tap. Agent access comes next; the plan is in the [godo README](crates/godo/README.md).
+**Status:** godo 0.2.0 runs Makefile targets from anywhere in a project as detachable, logged jobs and has a live dashboard (`godo watch`). Prebuilt binaries are on the [releases page](https://github.com/maytech-labs/godo/releases) and in the Homebrew tap. Agent access comes next; the plan is in the [godo README](crates/godo/README.md).
 
 Only interested in clapsmith? Work in `crates/clapsmith`, run `cargo test -p clapsmith`, and filter issues by the `crate:clapsmith` label. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
