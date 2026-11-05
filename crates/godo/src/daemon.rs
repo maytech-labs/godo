@@ -15,6 +15,10 @@
 //! Clients following a job can type into it and resize it: they send
 //! [`ClientMsg`]s on the same connection. With several attached, all can
 //! type, and the latest resize wins.
+//!
+//! A job can instead run on plain pipes (`pty: false`), for servers and
+//! logs that aren't read in a terminal: stdout and stderr are logged as
+//! `out` and `err`, stdin is empty, and typing and resizing do nothing.
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
@@ -50,6 +54,8 @@ struct Job {
     master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     /// Where clients' keystrokes go.
     input: Option<Box<dyn Write + Send>>,
+    /// Clients waiting for it to end ([`Request::Wait`]).
+    waiters: Vec<UnixStream>,
 }
 
 struct State {
@@ -113,6 +119,10 @@ fn listen(home: Home) -> io::Result<()> {
                 exit_code: None,
                 start_ms: proto::now_ms(),
                 end_ms: None,
+                origin: proto::Origin::Terminal,
+                client: None,
+                project: None,
+                pty: false,
             },
         }),
         home,
@@ -189,6 +199,11 @@ impl Daemon {
                 directive,
                 cols,
                 rows,
+                pty,
+                origin,
+                client,
+                project,
+                reuse,
             } => {
                 let spec = Spec {
                     argv,
@@ -198,6 +213,11 @@ impl Daemon {
                     directive,
                     cols,
                     rows,
+                    pty,
+                    origin,
+                    client,
+                    project,
+                    reuse,
                 };
                 if let Err((mut stream, message)) = self.start(spec, stream) {
                     let _ = proto::write(&mut stream, &Event::Error { message });
@@ -205,6 +225,7 @@ impl Daemon {
                 return;
             }
             Request::Attach { id } => return self.attach(id, stream),
+            Request::Wait { id } => return self.wait(id, stream),
             Request::Ps | Request::History => {
                 let state = self.lock();
                 let mut processes = vec![state.daemon.clone()];
@@ -252,62 +273,54 @@ impl Daemon {
     }
 
     fn start(self: &Arc<Self>, spec: Spec, stream: UnixStream) -> Result<(), (UnixStream, String)> {
-        let Some(program) = spec.argv.first() else {
+        if spec.argv.is_empty() {
             return Err((stream, "nothing to run".into()));
-        };
-        let pair = match native_pty_system().openpty(PtySize {
-            rows: spec.rows.max(1),
-            cols: spec.cols.max(1),
-            pixel_width: 0,
-            pixel_height: 0,
-        }) {
-            Ok(pair) => pair,
-            Err(e) => return Err((stream, format!("can't open a terminal: {e}"))),
-        };
-        let mut cmd = CommandBuilder::new(program);
-        cmd.args(&spec.argv[1..]);
-        cmd.cwd(&spec.cwd);
-        cmd.env_clear();
-        for (key, value) in &spec.env {
-            cmd.env(key, value);
         }
-        // As the C++ godo did: tools see a colour terminal.
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("COLORTERM", "truecolor");
-        cmd.env("CLICOLOR_FORCE", "1");
-        cmd.env("BAZEL_FORCE_COLOR", "1");
-        let reader = match pair.master.try_clone_reader() {
-            Ok(reader) => reader,
-            Err(e) => return Err((stream, format!("can't read the terminal: {e}"))),
-        };
-        let input = match pair.master.take_writer() {
-            Ok(input) => input,
-            Err(e) => return Err((stream, format!("can't write to the terminal: {e}"))),
-        };
-
+        let mut stream = stream;
+        if spec.reuse {
+            let state = self.lock();
+            let same = state.jobs.values().find(|j| {
+                let i = &j.info;
+                i.running
+                    && i.command == spec.argv.join(" ")
+                    && i.target == spec.target
+                    && i.directive == spec.directive
+                    && i.project == spec.project
+            });
+            if let Some(job) = same {
+                let id = job.info.id;
+                drop(state);
+                let _ = proto::write(&mut stream, &Event::Started { id, reused: true });
+                return Ok(());
+            }
+        }
         let mut state = self.lock();
         let id = state.next_id;
         let log = match LogWriter::open(&self.home.log(id)) {
             Ok(log) => log,
             Err(e) => return Err((stream, format!("can't open the job's log: {e}"))),
         };
-        let mut child = match pair.slave.spawn_command(cmd) {
-            Ok(child) => child,
-            Err(e) => return Err((stream, format!("can't start {program}: {e}"))),
+        let spawned = match if spec.pty {
+            spawn_pty(&spec)
+        } else {
+            spawn_pipes(&spec)
+        } {
+            Ok(spawned) => spawned,
+            Err(message) => return Err((stream, message)),
         };
-        // The job has its own copy; ours would keep the terminal open.
-        drop(pair.slave);
         state.next_id += 1;
-        let mut stream = stream;
         // If the client left already, the job still runs, as if detached.
         let mut clients = Vec::new();
-        if proto::write(&mut stream, &Event::Started { id }).is_ok() {
-            self.listen_to(id, &stream);
+        let started = Event::Started { id, reused: false };
+        if proto::write(&mut stream, &started).is_ok() && !spec.reuse {
+            if spec.pty {
+                self.listen_to(id, &stream);
+            }
             clients.push(stream);
         }
         let info = ProcessInfo {
             id,
-            pid: child.process_id().unwrap_or(0),
+            pid: spawned.pid,
             command: spec.argv.join(" "),
             target: spec.target,
             directive: spec.directive,
@@ -315,6 +328,10 @@ impl Daemon {
             exit_code: None,
             start_ms: proto::now_ms(),
             end_ms: None,
+            origin: spec.origin,
+            client: spec.client,
+            project: spec.project,
+            pty: spec.pty,
         };
         state.jobs.insert(
             id,
@@ -322,37 +339,45 @@ impl Daemon {
                 info,
                 clients,
                 log: Some(log),
-                master: Some(pair.master),
-                input: Some(input),
+                master: spawned.master,
+                input: spawned.input,
+                waiters: Vec::new(),
             },
         );
         self.save_history(&state);
         drop(state);
 
         let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let readers = spawned.readers.len();
+        for (name, reader) in spawned.readers {
+            let daemon = Arc::clone(self);
+            let done = done_tx.clone();
+            std::thread::spawn(move || {
+                daemon.pump(id, name, reader);
+                let _ = done.send(());
+            });
+        }
+        drop(done_tx);
         let daemon = Arc::clone(self);
+        let wait = spawned.wait;
         std::thread::spawn(move || {
-            daemon.pump(id, reader);
-            let _ = done_tx.send(());
-        });
-        let daemon = Arc::clone(self);
-        std::thread::spawn(move || {
-            let status = child.wait();
+            let code = wait();
             // Let the output finish. A background process the job left
             // behind can keep the terminal open, so don't wait forever.
-            let _ = done_rx.recv_timeout(Duration::from_secs(2));
-            let code = match status {
-                Ok(status) if status.signal().is_some() => 128 + signal_number(status.signal()),
-                Ok(status) => status.exit_code() as i32,
-                Err(_) => -1,
-            };
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            for _ in 0..readers {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if done_rx.recv_timeout(left).is_err() {
+                    break;
+                }
+            }
             daemon.finish(id, code);
         });
         Ok(())
     }
 
     /// Copies a job's output to its log and its clients.
-    fn pump(&self, id: u64, mut reader: Box<dyn Read + Send>) {
+    fn pump(&self, id: u64, stream: &'static str, mut reader: Box<dyn Read + Send>) {
         let mut chunker = proto::Utf8Chunker::default();
         let mut buf = [0u8; 4096];
         loop {
@@ -369,10 +394,10 @@ impl Daemon {
                 continue;
             };
             if let Some(log) = job.log.as_mut() {
-                let _ = log.write("out", &text);
+                let _ = log.write(stream, &text);
             }
             let event = Event::Log {
-                stream: "out".into(),
+                stream: stream.into(),
                 data: text,
             };
             broadcast(&mut job.clients, &event);
@@ -392,6 +417,11 @@ impl Daemon {
         job.log = None;
         broadcast(&mut job.clients, &Event::Exit { code });
         job.clients.clear();
+        let done = Event::Done {
+            process: job.info.clone(),
+        };
+        broadcast(&mut job.waiters, &done);
+        job.waiters.clear();
         self.prune(&mut state);
         self.save_history(&state);
     }
@@ -426,6 +456,27 @@ impl Daemon {
         } else {
             let code = job.info.exit_code.unwrap_or(-1);
             let _ = proto::write(&mut stream, &Event::Exit { code });
+        }
+    }
+
+    fn wait(&self, id: u64, mut stream: UnixStream) {
+        let mut state = self.lock();
+        let Some(job) = state.jobs.get_mut(&id) else {
+            drop(state);
+            let message = format!("no process with ID {id}");
+            let _ = proto::write(&mut stream, &Event::Error { message });
+            return;
+        };
+        if !job.info.running {
+            let process = job.info.clone();
+            drop(state);
+            let _ = proto::write(&mut stream, &Event::Done { process });
+            return;
+        }
+        if proto::write(&mut stream, &Event::Ok).is_ok() {
+            // Waiting can take as long as the job; only the reply is timed.
+            let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
+            job.waiters.push(stream);
         }
     }
 
@@ -555,6 +606,106 @@ struct Spec {
     directive: String,
     cols: u16,
     rows: u16,
+    pty: bool,
+    origin: proto::Origin,
+    client: Option<String>,
+    project: Option<std::path::PathBuf>,
+    reuse: bool,
+}
+
+/// A started job's process, before it's recorded.
+struct Spawned {
+    pid: u32,
+    /// Output to log, with the stream each is logged as.
+    readers: Vec<(&'static str, Box<dyn Read + Send>)>,
+    master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+    input: Option<Box<dyn Write + Send>>,
+    /// Blocks until the job ends; returns its exit code, or 128 + signal.
+    wait: Box<dyn FnOnce() -> i32 + Send>,
+}
+
+fn spawn_pty(spec: &Spec) -> Result<Spawned, String> {
+    let program = &spec.argv[0];
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: spec.rows.max(1),
+            cols: spec.cols.max(1),
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| format!("can't open a terminal: {e}"))?;
+    let mut cmd = CommandBuilder::new(program);
+    cmd.args(&spec.argv[1..]);
+    cmd.cwd(&spec.cwd);
+    cmd.env_clear();
+    for (key, value) in &spec.env {
+        cmd.env(key, value);
+    }
+    // As the C++ godo did: tools see a colour terminal.
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    cmd.env("CLICOLOR_FORCE", "1");
+    cmd.env("BAZEL_FORCE_COLOR", "1");
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| format!("can't read the terminal: {e}"))?;
+    let input = pair
+        .master
+        .take_writer()
+        .map_err(|e| format!("can't write to the terminal: {e}"))?;
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| format!("can't start {program}: {e}"))?;
+    // The job has its own copy; ours would keep the terminal open.
+    drop(pair.slave);
+    let pid = child.process_id().unwrap_or(0);
+    Ok(Spawned {
+        pid,
+        readers: vec![("out", reader)],
+        master: Some(pair.master),
+        input: Some(input),
+        wait: Box::new(move || match child.wait() {
+            Ok(status) if status.signal().is_some() => 128 + signal_number(status.signal()),
+            Ok(status) => status.exit_code() as i32,
+            Err(_) => -1,
+        }),
+    })
+}
+
+/// The job on pipes, leading its own process group so killing it reaches
+/// everything it started, as with a terminal.
+fn spawn_pipes(spec: &Spec) -> Result<Spawned, String> {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    use std::process::{Command, Stdio};
+    let program = &spec.argv[0];
+    let mut child = Command::new(program)
+        .args(&spec.argv[1..])
+        .current_dir(&spec.cwd)
+        .env_clear()
+        .envs(spec.env.iter().map(|(k, v)| (k, v)))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .map_err(|e| format!("can't start {program}: {e}"))?;
+    let out = child.stdout.take().expect("piped");
+    let err = child.stderr.take().expect("piped");
+    Ok(Spawned {
+        pid: child.id(),
+        readers: vec![("out", Box::new(out)), ("err", Box::new(err))],
+        master: None,
+        input: None,
+        wait: Box::new(move || match child.wait() {
+            Ok(status) => status
+                .code()
+                .or_else(|| status.signal().map(|s| 128 + s))
+                .unwrap_or(-1),
+            Err(_) => -1,
+        }),
+    })
 }
 
 /// History from a previous daemon. Jobs it left marked running can't be
@@ -578,6 +729,7 @@ fn load_history(home: &Home) -> BTreeMap<u64, Job> {
                 log: None,
                 master: None,
                 input: None,
+                waiters: Vec::new(),
             };
             (job.info.id, job)
         })

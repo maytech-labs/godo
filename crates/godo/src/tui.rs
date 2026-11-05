@@ -87,6 +87,20 @@ impl LogView {
         self.push(raw);
     }
 
+    /// The text of every line kept, without styles or trailing spaces, and
+    /// how many older lines were dropped before the first.
+    pub fn plain(&self) -> (usize, Vec<String>) {
+        let lines = self
+            .lines
+            .iter()
+            .map(|line| {
+                let text: String = line.iter().map(|cell| cell.c).collect();
+                text.trim_end().to_string()
+            })
+            .collect();
+        (self.dropped, lines)
+    }
+
     pub fn set_width(&mut self, width: usize) {
         self.width = width;
     }

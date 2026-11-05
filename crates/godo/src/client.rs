@@ -163,38 +163,133 @@ pub fn processes(home: &Home) -> clapsmith::Result<Vec<ProcessInfo>> {
     }
 }
 
-/// What a job runs and where, for [`run`].
+/// Whether jobs run in a pseudo-terminal unless asked otherwise: yes,
+/// unless `GODO_PTY` is `0`, `never`, or `false` (for servers, where
+/// nothing reads the output in a terminal).
+pub fn default_pty() -> bool {
+    !matches!(
+        std::env::var("GODO_PTY").as_deref(),
+        Ok("0" | "never" | "false")
+    )
+}
+
+/// The size a detached job's terminal gets when there's no terminal here
+/// to copy: wide, so tools wrap less in logs agents read.
+const DETACHED_SIZE: (u16, u16) = (120, 40);
+
+/// What a job runs and where, for [`run`] and [`start`].
 pub struct Job {
     pub argv: Vec<String>,
     pub cwd: PathBuf,
     pub env: Vec<(String, String)>,
     pub target: String,
     pub directive: String,
+    pub pty: bool,
+    pub origin: proto::Origin,
+    pub client: Option<String>,
+    pub project: Option<PathBuf>,
+}
+
+impl Job {
+    fn request(self, (cols, rows): (u16, u16), reuse: bool) -> Request {
+        Request::Run {
+            argv: self.argv,
+            cwd: self.cwd,
+            env: self.env,
+            target: self.target,
+            directive: self.directive,
+            cols,
+            rows,
+            pty: self.pty,
+            origin: self.origin,
+            client: self.client,
+            project: self.project,
+            reuse,
+        }
+    }
 }
 
 /// Runs a job in the daemon and follows its output. Ctrl+C detaches and
 /// leaves it running; Ctrl+C twice quickly kills it. Returns the job's
 /// exit code, or success when detached.
 pub fn run(home: &Home, job: Job) -> clapsmith::Result {
-    let (cols, rows) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
-    let request = Request::Run {
-        argv: job.argv,
-        cwd: job.cwd,
-        env: job.env,
-        target: job.target,
-        directive: job.directive,
-        cols,
-        rows,
+    let size = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
+    follow(home, job.request(size, false), true)
+}
+
+/// Starts a job in the daemon without following it. With `reuse`, an
+/// identical job that's already running is returned instead. Returns the
+/// job's id and whether it was reused.
+pub fn start(home: &Home, job: Job, reuse: bool) -> clapsmith::Result<(u64, bool)> {
+    let size = ratatui::crossterm::terminal::size().unwrap_or(DETACHED_SIZE);
+    let Some((_, first)) = open(home, &job.request(size, reuse), true)? else {
+        unreachable!("open starts the daemon");
     };
-    follow(home, request, true)
+    match first {
+        Event::Started { id, reused } => Ok((id, reused)),
+        Event::Error { message } => Err(message.into()),
+        other => Err(format!("unexpected reply from the daemon: {other:?}").into()),
+    }
+}
+
+/// Waits up to `timeout` (forever if `None`) for a job to end. Returns the
+/// job, which is still running if the wait timed out.
+pub fn wait(home: &Home, id: u64, timeout: Option<Duration>) -> clapsmith::Result<ProcessInfo> {
+    let saved = || {
+        saved_history(home)
+            .into_iter()
+            .find(|p| p.id == id)
+            .ok_or_else(|| clapsmith::Error::from(format!("no process with ID {id}")))
+    };
+    let Some((mut stream, first)) = open(home, &Request::Wait { id }, false)? else {
+        // Without the daemon nothing runs; its history says how jobs ended.
+        return saved();
+    };
+    match first {
+        Event::Done { process } => return Ok(process),
+        Event::Ok => {}
+        Event::Error { message } => return Err(message.into()),
+        other => return Err(format!("unexpected reply from the daemon: {other:?}").into()),
+    }
+    stream.set_read_timeout(timeout)?;
+    match proto::read::<Event>(&mut stream) {
+        Ok(Some(Event::Done { process })) => Ok(process),
+        Ok(Some(other)) => Err(format!("unexpected reply from the daemon: {other:?}").into()),
+        // The daemon stopped, and the job with it.
+        Ok(None) => saved(),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
+            jobs(home)?
+                .into_iter()
+                .find(|p| p.id == id)
+                .ok_or_else(|| format!("no process with ID {id}").into())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Stops a running job and everything it started.
+pub fn kill(home: &Home, id: u64) -> clapsmith::Result<()> {
+    match ask(home, Request::Kill { id }, false)? {
+        None => Err(format!("no running process with ID {id} (the daemon isn't running)").into()),
+        Some(_) => Ok(()),
+    }
+}
+
+/// A process ID as typed: `3` or `"3"`.
+pub fn parse_id(id: &str) -> clapsmith::Result<u64> {
+    id.trim_matches('"')
+        .parse()
+        .map_err(|_| format!("`{id}` isn't a process ID; see `godo ps`").into())
 }
 
 /// `godo attach -i <id>`: replays a job's output and follows it.
 pub fn attach(home: &Home, id: &str) -> clapsmith::Result {
-    let id: u64 = id
-        .trim_matches('"')
-        .parse()
-        .map_err(|_| format!("`{id}` isn't a process ID; see `godo ps`"))?;
+    let id = parse_id(id)?;
     if connect(home).is_none() {
         // Nothing runs without the daemon, so replay the saved log.
         let Some(job) = saved_history(home).into_iter().find(|p| p.id == id) else {
@@ -368,7 +463,7 @@ fn follow_events(home: &Home, rx: &mpsc::Receiver<Msg>, out: &Out) -> clapsmith:
             None => rx.recv().map_err(|_| "lost the connection to the daemon")?,
         };
         match msg {
-            Msg::Event(Event::Started { id: started }) => {
+            Msg::Event(Event::Started { id: started, .. }) => {
                 id = Some(started);
                 out.say(&format!(
                     "Process started with ID: {started} (Ctrl+C to detach, Ctrl+C Ctrl+C to kill)"

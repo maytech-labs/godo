@@ -15,20 +15,18 @@ use crate::config::Config;
 /// `godo <directive> <target> [make args...]` runs
 /// `make -C <target dir> <directive> [make args...]` with `GODO_ROOT` set to
 /// the root, through the daemon in a terminal and in the foreground elsewhere.
+/// With `--detach` it always goes to the daemon and returns once started.
 pub fn run(config: &Config, words: &[OsString], verbose: bool) -> clapsmith::Result {
     let parsed = parse_words(words)?;
     let verbose = verbose || parsed.verbose;
-    let (directive, target, extra) = (&parsed.directive, &parsed.target, &parsed.extra);
-    let name = target.to_string_lossy().into_owned();
-    let Some(target) = config.target(&name) else {
-        return Err(unknown_target(config, &name).into());
-    };
-    let dir = config.dir(target);
-    // GNU make announces "Entering directory" for -C; that's noise here.
-    let mut argv: Vec<String> = vec!["make".into(), "--no-print-directory".into(), "-C".into()];
-    argv.push(dir.to_string_lossy().into_owned());
-    argv.push(directive.to_string_lossy().into_owned());
-    argv.extend(extra.iter().map(|a| a.to_string_lossy().into_owned()));
+    let name = parsed.target.to_string_lossy().into_owned();
+    let directive = parsed.directive.to_string_lossy().into_owned();
+    let extra: Vec<String> = parsed
+        .extra
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let argv = make_argv(config, &name, &directive, &extra)?;
     if verbose {
         eprintln!(
             "godo: {} (GODO_ROOT={}, from {})",
@@ -37,12 +35,43 @@ pub fn run(config: &Config, words: &[OsString], verbose: bool) -> clapsmith::Res
             display(&config.file, &config.root),
         );
     }
+    if parsed.json && !parsed.detach {
+        return Err(
+            "--json is for --detach; to follow a job as JSON, use `godo logs --json`".into(),
+        );
+    }
+    let pty = !parsed.no_pty && crate::client::default_pty();
+    if parsed.detach {
+        let home = crate::proto::Home::resolve()?;
+        let job = job(
+            argv,
+            config,
+            &name,
+            &directive,
+            pty,
+            crate::proto::Origin::here(),
+            None,
+        )?;
+        let (id, _) = crate::client::start(&home, job, false)?;
+        if parsed.json {
+            println!("{}", serde_json::json!({ "id": id }));
+        } else {
+            println!("Process started with ID: {id} (`godo wait -i {id}`, `godo logs -i {id}`)");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     if crate::client::use_daemon() {
         let home = crate::proto::Home::resolve()?;
-        return crate::client::run(
-            &home,
-            job(argv, config, &name, &directive.to_string_lossy())?,
-        );
+        let job = job(
+            argv,
+            config,
+            &name,
+            &directive,
+            pty,
+            crate::proto::Origin::here(),
+            None,
+        )?;
+        return crate::client::run(&home, job);
     }
     let mut make = Command::new("make");
     make.args(&argv[1..]).env("GODO_ROOT", &config.root);
@@ -50,6 +79,26 @@ pub fn run(config: &Config, words: &[OsString], verbose: bool) -> clapsmith::Res
         .status()
         .map_err(|error| format!("can't run make: {error}"))?;
     Ok(exit_code(status))
+}
+
+/// `make --no-print-directory -C <dir> <directive> [extra...]` for a
+/// registered target.
+pub fn make_argv(
+    config: &Config,
+    target: &str,
+    directive: &str,
+    extra: &[String],
+) -> clapsmith::Result<Vec<String>> {
+    let Some(t) = config.target(target) else {
+        return Err(unknown_target(config, target).into());
+    };
+    let dir = config.dir(t);
+    // GNU make announces "Entering directory" for -C; that's noise here.
+    let mut argv: Vec<String> = vec!["make".into(), "--no-print-directory".into(), "-C".into()];
+    argv.push(dir.to_string_lossy().into_owned());
+    argv.push(directive.to_string());
+    argv.extend(extra.iter().cloned());
+    Ok(argv)
 }
 
 /// `godo <directive> <target> [words...] [-- make args...]`, taken apart.
@@ -60,21 +109,31 @@ pub struct Words {
     /// For make: plain words and `VAR=value`, then everything after `--`.
     pub extra: Vec<OsString>,
     pub verbose: bool,
+    /// `-d`/`--detach`: start it in the daemon and return.
+    pub detach: bool,
+    /// `--no-pty`: run on plain pipes, not in a pseudo-terminal.
+    pub no_pty: bool,
+    /// `--json`: with `--detach`, print `{"id": N}`.
+    pub json: bool,
 }
 
-/// godo's own flags (`-v`) count wherever they are, up to `--`. Other
+/// godo's own flags (`-v`, `-d`, `--no-pty`, `--json`) count wherever they are, up to `--`. Other
 /// words go to make, but a flag make should get has to come after `--`,
 /// so a mistyped godo flag never silently becomes make's.
 pub fn parse_words(words: &[OsString]) -> clapsmith::Result<Words> {
     let mut positional: Vec<OsString> = Vec::new();
     let mut after: Vec<OsString> = Vec::new();
     let mut verbose = false;
+    let (mut detach, mut no_pty, mut json) = (false, false, false);
     let mut iter = words.iter();
     for word in iter.by_ref() {
         let text = word.to_string_lossy();
         match text.as_ref() {
             "--" => break,
             "-v" | "--verbose" => verbose = true,
+            "-d" | "--detach" => detach = true,
+            "--no-pty" => no_pty = true,
+            "--json" => json = true,
             flag if flag.starts_with('-') && flag.len() > 1 => {
                 return Err(format!(
                     "`{flag}` isn't a godo flag. To pass it to make, put it after `--`: godo {} {} -- {flag}",
@@ -105,6 +164,9 @@ pub fn parse_words(words: &[OsString]) -> clapsmith::Result<Words> {
         target,
         extra,
         verbose,
+        detach,
+        no_pty,
+        json,
     })
 }
 
@@ -124,11 +186,14 @@ pub(crate) fn unknown_target(config: &Config, name: &str) -> String {
 }
 
 /// A daemon job running `argv` here, with this environment plus `GODO_ROOT`.
-fn job(
+pub fn job(
     argv: Vec<String>,
     config: &Config,
     target: &str,
     directive: &str,
+    pty: bool,
+    origin: crate::proto::Origin,
+    client: Option<String>,
 ) -> clapsmith::Result<crate::client::Job> {
     let mut env: Vec<(String, String)> =
         std::env::vars().filter(|(k, _)| k != "GODO_ROOT").collect();
@@ -142,6 +207,10 @@ fn job(
         env,
         target: target.to_string(),
         directive: directive.to_string(),
+        pty,
+        origin,
+        client,
+        project: Some(config.root.clone()),
     })
 }
 

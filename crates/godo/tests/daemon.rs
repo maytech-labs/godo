@@ -36,6 +36,8 @@ ask:
 \t@printf 'name? '; read n; echo \"hello $$n\"
 size:
 \t@stty size; trap 'stty size' WINCH; for i in 1 2 3 4 5 6 7 8 9 10; do sleep 0.3; done
+both:
+\t@echo to-out; echo to-err >&2; printf 'progress 1\\rprogress 2\\r\\033[Kdone\\n'
 big:
 \t@echo FIRST-LINE; head -c 1500000 /dev/zero | tr '\\0' x; echo; echo big-ready; sleep 30
 ",
@@ -598,4 +600,297 @@ fn ps_history_and_attach_work_without_the_daemon() {
         !e.home.join("godo.sock").exists(),
         "none of that started the daemon"
     );
+}
+
+fn json(out: &Output) -> serde_json::Value {
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "not JSON ({e}): {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            stderr(out)
+        )
+    })
+}
+
+/// Starts `godo <args> --detach --json` and returns the job's id.
+fn detach(e: &Env, args: &[&str]) -> u64 {
+    let mut args = args.to_vec();
+    args.extend(["--detach", "--json"]);
+    let out = e.godo(&args);
+    assert!(out.status.success(), "{}", stderr(&out));
+    json(&out)["id"].as_u64().unwrap()
+}
+
+#[test]
+fn detached_jobs_can_be_waited_for_and_read_as_plain_text() {
+    let e = Env::new("detach");
+    let id = detach(&e, &["both", "app"]);
+    let out = e.godo(&["wait", "-i", &id.to_string(), "--timeout", "15s", "--json"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let waited = json(&out);
+    assert_eq!(waited["job"]["status"], "success", "{waited}");
+    assert_eq!(waited["job"]["origin"], "shell", "{waited}");
+    assert_eq!(waited["job"]["pty"], true, "{waited}");
+    let logs = e.stdout(&["logs", "-i", &id.to_string()]);
+    assert!(logs.contains("to-out\nto-err\ndone\n"), "{logs:?}");
+    assert!(
+        !logs.contains("progress") && !logs.contains('\x1b'),
+        "{logs:?}"
+    );
+    let grep = e.stdout(&["logs", "-i", &id.to_string(), "--grep", "^to-err"]);
+    assert_eq!(grep, "2:to-err\n");
+}
+
+#[test]
+fn no_pty_runs_on_pipes_and_keeps_stderr_apart() {
+    let e = Env::new("nopty");
+    let id = detach(&e, &["both", "app", "--no-pty"]);
+    let out = e.godo(&["wait", "-i", &id.to_string(), "--timeout", "15s"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let logs = e.stdout(&["logs", "-i", &id.to_string()]);
+    assert!(
+        logs.contains("to-out") && logs.contains("err:to-err"),
+        "{logs:?}"
+    );
+    let history = json(&e.godo(&["history", "--json"]));
+    assert_eq!(history[0]["pty"], false, "{history}");
+    // GODO_PTY=0 makes pipes the default.
+    let out = e
+        .command(&e.root, &["both", "app", "-d", "--json"])
+        .env("GODO_PTY", "0")
+        .output()
+        .unwrap();
+    let id = json(&out)["id"].as_u64().unwrap();
+    let _ = e.godo(&["wait", "-i", &id.to_string(), "--timeout", "15s"]);
+    let history = json(&e.godo(&["history", "--json"]));
+    assert_eq!(history[0]["pty"], false, "{history}");
+}
+
+#[test]
+fn waiting_times_out_and_kill_stops_the_job() {
+    let e = Env::new("waitkill");
+    let id = detach(&e, &["slow", "app"]).to_string();
+    let out = e.godo(&["wait", "-i", &id, "--timeout", "1s"]);
+    assert_eq!(out.status.code(), Some(124), "{}", stderr(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("still running"));
+    let ps = json(&e.godo(&["ps", "--json"]));
+    assert_eq!(ps.as_array().unwrap().len(), 1, "{ps}");
+    assert!(e.godo(&["kill", "-i", &id]).status.success());
+    let out = e.godo(&["wait", "-i", &id, "--timeout", "15s", "--json"]);
+    assert!(!out.status.success());
+    assert_eq!(json(&out)["job"]["status"], "failed");
+}
+
+/// `godo mcp`, spoken to over its stdin and stdout.
+struct Mcp {
+    child: Child,
+    stdin: std::process::ChildStdin,
+    lines: std::sync::mpsc::Receiver<String>,
+    next: u64,
+}
+
+impl Mcp {
+    fn start(e: &Env) -> Self {
+        let mut child = e
+            .command(&e.root, &["mcp"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let out = child.stdout.take().unwrap();
+        let (tx, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(out).lines().map_while(Result::ok) {
+                let _ = tx.send(line);
+            }
+        });
+        let mut mcp = Self {
+            child,
+            stdin,
+            lines,
+            next: 1,
+        };
+        let init = mcp.request(
+            "initialize",
+            serde_json::json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "test-agent", "version": "1" }
+            }),
+        );
+        assert_eq!(init["result"]["serverInfo"]["name"], "godo", "{init}");
+        mcp.send(serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
+        mcp
+    }
+
+    fn send(&mut self, message: serde_json::Value) {
+        use std::io::Write;
+        writeln!(self.stdin, "{message}").unwrap();
+        self.stdin.flush().unwrap();
+    }
+
+    fn request(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+        let id = self.next;
+        self.next += 1;
+        self.send(
+            serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
+        );
+        loop {
+            let line = self
+                .lines
+                .recv_timeout(Duration::from_secs(30))
+                .expect("godo mcp answers");
+            let reply: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if reply["id"] == id {
+                return reply;
+            }
+        }
+    }
+
+    /// Calls a tool; returns its text and whether it's an error.
+    fn call(&mut self, tool: &str, args: serde_json::Value) -> (String, bool) {
+        let reply = self.request(
+            "tools/call",
+            serde_json::json!({ "name": tool, "arguments": args }),
+        );
+        let result = &reply["result"];
+        assert!(result.is_object(), "{reply}");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        (text, result["isError"] == true)
+    }
+}
+
+impl Drop for Mcp {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn mcp_lists_runs_and_reports_jobs() {
+    let e = Env::new("mcp");
+    let mut mcp = Mcp::start(&e);
+    let tools = mcp.request("tools/list", serde_json::json!({}));
+    let names: Vec<&str> = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    for name in ["list_targets", "run", "wait", "logs", "list_jobs", "kill"] {
+        assert!(names.contains(&name), "{names:?}");
+    }
+    let (targets, _) = mcp.call("list_targets", serde_json::json!({}));
+    assert!(
+        targets.contains("app (app)") && targets.contains("  hello"),
+        "{targets}"
+    );
+
+    let (text, error) = mcp.call(
+        "run",
+        serde_json::json!({ "target": "app", "directive": "both" }),
+    );
+    assert!(!error, "{text}");
+    assert!(text.contains("job 1: both app: succeeded"), "{text}");
+    assert!(text.contains("by an agent"), "{text}");
+    assert!(
+        text.contains("2| to-err") && text.contains("3| done"),
+        "{text}"
+    );
+
+    let (text, error) = mcp.call(
+        "run",
+        serde_json::json!({ "target": "app", "directive": "fail" }),
+    );
+    assert!(
+        !error,
+        "a failed build is a result, not a tool error: {text}"
+    );
+    assert!(text.contains("failed (exit 2)"), "{text}");
+
+    let (text, _) = mcp.call("logs", serde_json::json!({ "id": 1, "grep": "^to-" }));
+    assert!(
+        text.contains("1| to-out") && text.contains("2| to-err") && !text.contains("done"),
+        "{text}"
+    );
+
+    let (text, _) = mcp.call("list_jobs", serde_json::json!({}));
+    assert!(
+        text.find("job 2").unwrap() < text.find("job 1").unwrap(),
+        "newest first: {text}"
+    );
+    let history = json(&e.godo(&["history", "--json"]));
+    assert_eq!(history[0]["client"], "test-agent", "{history}");
+}
+
+#[test]
+fn mcp_returns_running_jobs_reuses_them_and_kills_its_own() {
+    let e = Env::new("mcp-slow");
+    let mut mcp = Mcp::start(&e);
+    let run = serde_json::json!({ "target": "app", "directive": "slow", "wait_seconds": 1 });
+    let (text, _) = mcp.call("run", run.clone());
+    assert!(text.contains("job 1: slow app: running"), "{text}");
+    assert!(
+        text.contains("still running: call wait with id 1"),
+        "{text}"
+    );
+    let (text, _) = mcp.call("run", run);
+    assert!(
+        text.contains("already running") && text.contains("job 1:"),
+        "{text}"
+    );
+    let (text, _) = mcp.call("wait", serde_json::json!({ "id": 1, "timeout_seconds": 1 }));
+    assert!(text.contains("running"), "{text}");
+
+    // A job from a terminal or shell isn't the agent's to kill by default.
+    let other = detach(&e, &["slow", "app"]);
+    let (text, error) = mcp.call("kill", serde_json::json!({ "id": other }));
+    assert!(error && text.contains("doesn't let agents kill"), "{text}");
+    let (text, error) = mcp.call("kill", serde_json::json!({ "id": 1 }));
+    assert!(!error, "{text}");
+    let (text, _) = mcp.call(
+        "wait",
+        serde_json::json!({ "id": 1, "timeout_seconds": 15 }),
+    );
+    assert!(text.contains("failed"), "{text}");
+}
+
+#[test]
+fn mcp_follows_the_projects_agent_rules() {
+    let e = Env::new("mcp-rules");
+    std::fs::write(
+        e.root.join("godo.toml"),
+        "[targets]\napp = \"app\"\n\n[agents]\ndeny = [\"fail *\"]\n",
+    )
+    .unwrap();
+    let mut mcp = Mcp::start(&e);
+    let (targets, _) = mcp.call("list_targets", serde_json::json!({}));
+    assert!(
+        targets.contains("hello") && !targets.contains("fail"),
+        "{targets}"
+    );
+    let (text, error) = mcp.call(
+        "run",
+        serde_json::json!({ "target": "app", "directive": "fail" }),
+    );
+    assert!(
+        error && text.contains("doesn't let agents run `fail app`"),
+        "{text}"
+    );
+    let (text, error) = mcp.call(
+        "run",
+        serde_json::json!({ "target": "app", "directive": "hello", "args": ["FOO=1"] }),
+    );
+    assert!(error && text.contains("make_args"), "{text}");
+    let (text, error) = mcp.call(
+        "run",
+        serde_json::json!({ "target": "nope", "directive": "hello" }),
+    );
+    assert!(error && text.contains("no target named `nope`"), "{text}");
 }

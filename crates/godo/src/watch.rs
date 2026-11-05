@@ -357,19 +357,26 @@ impl<S: Source> Watcher<S> {
             None => (" ○ ", YELLOW),
         };
         let dot = Span::styled(dot, Style::new().fg(colour));
+        // Jobs `godo mcp` started for an agent are marked.
+        let by_agent = newest.is_some_and(|p| p.origin == crate::proto::Origin::Agent);
+        let mark = Span::styled(
+            if by_agent { " agent" } else { "" },
+            Style::new().fg(tui::BORDER),
+        );
         if key == self.selected {
             // Columns, not characters: wide characters take two.
-            let used = 2 + 3 + unicode_width::UnicodeWidthStr::width(key);
+            let used = 2 + 3 + unicode_width::UnicodeWidthStr::width(key) + mark.content.len();
             let pad = " ".repeat(width.saturating_sub(used));
             Line::from(vec![
                 Span::raw("> "),
                 dot,
                 Span::styled(key.to_string(), Style::new().fg(WHITE)),
+                mark,
                 Span::raw(pad),
             ])
             .style(Style::new().bg(SELECTED_BG))
         } else {
-            Line::from(vec![Span::raw("  "), dot, Span::raw(key.to_string())])
+            Line::from(vec![Span::raw("  "), dot, Span::raw(key.to_string()), mark])
         }
     }
 }
@@ -476,6 +483,10 @@ mod tests {
             exit_code: code,
             start_ms: crate::proto::now_ms(),
             end_ms: None,
+            origin: Default::default(),
+            client: None,
+            project: None,
+            pty: true,
         }
     }
 
@@ -546,6 +557,32 @@ mod tests {
         assert_eq!(buf[(29, 2)].symbol(), "│", "{}", row(&buf, 2));
         // ratatui clips at the border anyway, so check the line itself.
         assert_eq!(w.target_line("构建 网站", 28).width(), 28);
+    }
+
+    #[test]
+    fn targets_an_agent_ran_last_are_marked() {
+        let mut agent = job(2, "build", "web", true, None);
+        agent.origin = crate::proto::Origin::Agent;
+        let mut w = fake(
+            "agent",
+            vec![
+                job(1, "build", "web", false, Some(0)),
+                agent,
+                job(3, "test", "web", true, None),
+            ],
+        );
+        w.tick();
+        let buf = screen(&mut w, 80, 8);
+        let rows: Vec<String> = (2..4).map(|y| row(&buf, y)).collect();
+        assert!(
+            rows.iter().any(|r| r.contains("build web agent")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("test web") && !r.contains("agent")),
+            "{rows:?}"
+        );
     }
 
     #[test]

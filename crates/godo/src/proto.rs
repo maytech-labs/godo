@@ -140,6 +140,17 @@ pub enum Request {
         directive: String,
         cols: u16,
         rows: u16,
+        /// In a pseudo-terminal (the default), or on plain pipes.
+        pty: bool,
+        origin: Origin,
+        /// The MCP client that asked, for [`Origin::Agent`].
+        client: Option<String>,
+        /// The godo project's root, for filtering jobs by project.
+        project: Option<PathBuf>,
+        /// If the same job is already running, answer
+        /// [`Event::Started`] with its id and `reused` instead of starting
+        /// another, and close the connection.
+        reuse: bool,
     },
     /// Every job the daemon knows, with the daemon itself first.
     Ps,
@@ -147,6 +158,11 @@ pub enum Request {
     HistoryClear,
     /// Replay a job's output, then stream it if it's still running.
     Attach {
+        id: u64,
+    },
+    /// Answers [`Event::Done`] once the job has ended: at once if it has,
+    /// else [`Event::Ok`] now and [`Event::Done`] when it ends.
+    Wait {
         id: u64,
     },
     /// Stop a job and everything it started.
@@ -174,6 +190,9 @@ pub enum ClientMsg {
 pub enum Event {
     Started {
         id: u64,
+        /// The job was already running; see [`Request::Run`]'s `reuse`.
+        #[serde(default)]
+        reused: bool,
     },
     Attached {
         id: u64,
@@ -184,6 +203,10 @@ pub enum Event {
     },
     Exit {
         code: i32,
+    },
+    /// A job that has ended, for [`Request::Wait`].
+    Done {
+        process: ProcessInfo,
     },
     Processes {
         processes: Vec<ProcessInfo>,
@@ -217,6 +240,56 @@ pub struct ProcessInfo {
     /// Milliseconds since the Unix epoch.
     pub start_ms: u64,
     pub end_ms: Option<u64>,
+    /// Who started it. History from before godo 0.3 says `terminal`.
+    #[serde(default)]
+    pub origin: Origin,
+    /// The MCP client, for jobs an agent started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
+    /// The root of the godo project it ran in, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<PathBuf>,
+    /// Whether it ran in a pseudo-terminal or on plain pipes.
+    #[serde(default = "yes")]
+    pub pty: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// Who started a job.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    /// godo in a terminal.
+    #[default]
+    Terminal,
+    /// godo from a script, pipe, or an agent's shell.
+    Shell,
+    /// `godo mcp`, on an agent's behalf.
+    Agent,
+}
+
+impl Origin {
+    /// [`Origin::Terminal`] with a terminal on stdin and stdout, else
+    /// [`Origin::Shell`].
+    pub fn here() -> Self {
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            Self::Terminal
+        } else {
+            Self::Shell
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Terminal => "terminal",
+            Self::Shell => "shell",
+            Self::Agent => "agent",
+        }
+    }
 }
 
 impl ProcessInfo {
