@@ -335,6 +335,10 @@ mod tests {
             exit_code: code,
             start_ms: 0,
             end_ms: None,
+            origin: Default::default(),
+            client: None,
+            project: None,
+            pty: true,
         }
     }
 

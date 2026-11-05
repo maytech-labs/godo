@@ -4,6 +4,18 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ## Unreleased
 
+### Added
+
+- **`godo mcp`**: an MCP server so coding agents can use godo without holding a terminal. Its tools are `list_targets`, `run` (waits up to `wait_seconds` and returns the exit code and the end of the output, or the job still running; returns an identical running job instead of starting another), `wait`, `logs` (plain text, numbered lines, `from_line`/`tail`/`grep`), `list_jobs`, and `kill`. `-C <dir>` picks the project.
+- **`[agents]` in `godo.toml`** limits what agents may do through `godo mcp`: `allow` and `deny` patterns (`"directive target"`, `*` matches anything), `make_args` (default false), and `kill` (`agent`, the default, `all`, or `none`).
+- **`--detach` / `-d`** starts a job in the daemon and returns its ID, in a terminal or not (`--json` prints `{"id": N}`). `godo run -c` takes `--detach` too.
+- **`godo wait -i <id> [--timeout 10m] [--tail N]`** exits with the job's exit code, or 124 if it's still running.
+- **`godo logs -i <id>`** prints a job's output as plain text, drawn as a terminal would draw it, so progress bars are collapsed to their last state. `--from N` gives what's new since a previous call, plus `--tail N` and `--grep REGEX`.
+- **`godo kill -i <id>`.**
+- **`--json`** on `ps`, `history`, `list`, `wait`, and `logs`.
+- **`--no-pty`**, or `GODO_PTY=0` to make it the default, runs jobs on plain pipes instead of a pseudo-terminal, for servers. stderr is logged apart from stdout.
+- Jobs record who started them (a terminal, a shell, or an agent, with the MCP client's name) and their project. `godo watch` marks targets an agent ran last.
+
 ## 0.2.0 - 2026-11-04
 
 ### Added

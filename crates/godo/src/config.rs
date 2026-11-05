@@ -18,6 +18,16 @@
 //!   protobuf dependency.
 //!
 //! If a directory has both, `godo.toml` wins.
+//!
+//! `godo.toml` can also limit what agents may do through `godo mcp`:
+//!
+//! ```toml
+//! [agents]
+//! allow = ["build *", "test *"]  # "directive target"; * is any. Default: all
+//! deny = ["deploy *"]            # checked after allow
+//! make_args = false              # VAR=value and flags for make. Default: false
+//! kill = "agent"                 # jobs agents may kill: agent, all, none
+//! ```
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -42,6 +52,77 @@ pub struct Config {
     /// The registry file that was read.
     pub file: PathBuf,
     pub targets: Vec<Target>,
+    /// What agents may do through `godo mcp`.
+    pub agents: Agents,
+}
+
+/// The `[agents]` table of `godo.toml`.
+#[derive(serde::Deserialize, Debug, Clone, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct Agents {
+    /// `"directive target"` patterns agents may run; `*` matches anything.
+    pub allow: Vec<String>,
+    /// Patterns agents may not run, even if allowed.
+    pub deny: Vec<String>,
+    /// Whether agents may pass make extra arguments (`VAR=value`, flags),
+    /// which can make it run anything.
+    pub make_args: bool,
+    pub kill: Kill,
+}
+
+impl Default for Agents {
+    fn default() -> Self {
+        Self {
+            allow: vec!["* *".into()],
+            deny: Vec::new(),
+            make_args: false,
+            kill: Kill::Agent,
+        }
+    }
+}
+
+/// Which jobs agents may kill.
+#[derive(serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Kill {
+    /// Only jobs an agent started.
+    Agent,
+    All,
+    None,
+}
+
+impl Agents {
+    /// Whether agents may run `godo <directive> <target>`.
+    pub fn allows(&self, directive: &str, target: &str) -> bool {
+        let hit = |patterns: &[String]| {
+            patterns.iter().any(|p| {
+                let mut words = p.split_whitespace();
+                let (d, t) = (words.next().unwrap_or("*"), words.next().unwrap_or("*"));
+                glob(d, directive) && glob(t, target)
+            })
+        };
+        hit(&self.allow) && !hit(&self.deny)
+    }
+}
+
+/// `*` matches any run of characters; everything else matches itself.
+fn glob(pattern: &str, text: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == text;
+    }
+    let (first, last) = (parts[0], parts[parts.len() - 1]);
+    if !text.starts_with(first) || text.len() < first.len() + last.len() || !text.ends_with(last) {
+        return false;
+    }
+    let mut rest = &text[first.len()..text.len() - last.len()];
+    for part in &parts[1..parts.len() - 1] {
+        match rest.find(part) {
+            Some(i) => rest = &rest[i + part.len()..],
+            None => return false,
+        }
+    }
+    true
 }
 
 #[derive(Debug)]
@@ -87,7 +168,10 @@ impl Config {
                     path: toml.clone(),
                     error,
                 })?;
-                return Self::read(dir, toml, |_| parse_toml(&text));
+                let mut config = Self::read(dir, toml.clone(), |_| parse_toml(&text))?;
+                config.agents = parse_agents(&text)
+                    .map_err(|reason| Error::Malformed { path: toml, reason })?;
+                return Ok(config);
             }
             let legacy = dir.join(LEGACY_PATH);
             if legacy.is_file() {
@@ -116,6 +200,7 @@ impl Config {
             root: root.to_path_buf(),
             file,
             targets,
+            agents: Agents::default(),
         })
     }
 
@@ -134,6 +219,14 @@ impl Config {
 struct TomlRegistry {
     #[serde(default)]
     targets: toml::Table,
+    #[serde(default)]
+    agents: Agents,
+}
+
+/// The `[agents]` table of `godo.toml`, or the defaults without one.
+pub fn parse_agents(text: &str) -> Result<Agents, String> {
+    let registry: TomlRegistry = toml::from_str(text).map_err(|e| e.message().to_string())?;
+    Ok(registry.agents)
 }
 
 /// Parses `godo.toml`. Targets keep the order they're written in.
@@ -326,6 +419,39 @@ mod tests {
         let err = parse_toml("[target]\nweb = \"x\"\n").unwrap_err();
         assert!(err.contains("target"), "{err}");
         assert!(parse_toml("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn agents_may_do_anything_but_pass_make_args_by_default() {
+        let a = parse_agents("[targets]\n").unwrap();
+        assert!(a.allows("build", "web") && a.allows("deploy", "prod"));
+        assert!(!a.make_args);
+        assert_eq!(a.kill, Kill::Agent);
+    }
+
+    #[test]
+    fn agent_patterns_allow_then_deny() {
+        let a = parse_agents(
+            "[agents]\nallow = [\"build *\", \"test web*\"]\ndeny = [\"* secret\"]\nkill = \"none\"\n",
+        )
+        .unwrap();
+        assert!(a.allows("build", "api"));
+        assert!(a.allows("test", "web-ui"));
+        assert!(!a.allows("test", "api"));
+        assert!(!a.allows("build", "secret"));
+        assert!(!a.allows("deploy", "web"));
+        assert_eq!(a.kill, Kill::None);
+        let err = parse_agents("[agents]\nallw = []\n").unwrap_err();
+        assert!(err.contains("allw"), "{err}");
+    }
+
+    #[test]
+    fn globs() {
+        assert!(glob("*", ""));
+        assert!(glob("a*c", "abc") && glob("a*c", "ac"));
+        assert!(!glob("a*c", "ab"));
+        assert!(glob("*b*", "abc") && !glob("*x*", "abc"));
+        assert!(!glob("ab*ba", "aba"), "the ends can't overlap");
     }
 
     #[test]
