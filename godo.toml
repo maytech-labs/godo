@@ -6,3 +6,4 @@
 [targets]
 godo = "."
 clapsmith = "crates/clapsmith"
+termigatchi = "crates/termigatchi"

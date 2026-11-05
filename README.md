@@ -4,16 +4,43 @@
 
 Source-available under the [Reciprocal Ethical AI License (REAL) 1.0](LICENSE.md).
 
-This repository holds two projects that are developed together:
+This repository holds projects that are developed together:
 
 | Crate | What it is | Docs |
 |---|---|---|
 | [`godo-cli`](crates/godo) | **godo**, the tool: make, but every run is a detachable, logged, watchable job. Installs the `godo` binary. | [README](crates/godo/README.md) |
 | [`clapsmith`](crates/clapsmith) | A companion to [clap]: typed dispatch to command handlers, interactive mode, styled output. Usable without godo. | [README](crates/clapsmith/README.md), [docs.rs](https://docs.rs/clapsmith) |
 | [`clapsmith-derive`](crates/clapsmith-derive) | clapsmith's derive macros. Use through `clapsmith`. | |
+| [`termigatchi`](crates/termigatchi) | **termigatchi**, a tiny always-alive pet that lives in your terminal, with minigames. Installs the `termigatchi` binary. | [README](crates/termigatchi/README.md) |
 
 **Status:** godo 0.2.0 runs Makefile targets from anywhere in a project as detachable, logged jobs, with a live dashboard (`godo watch`), with prebuilt binaries on the [releases page](https://github.com/maytech-labs/godo/releases) and in the Homebrew tap. Agent access comes next; the plan is in the [godo README](crates/godo/README.md).
 
 Only interested in clapsmith? Work in `crates/clapsmith`, run `cargo test -p clapsmith`, and filter issues by the `crate:clapsmith` label. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## termigatchi, a little extra
+
+```
+   .-"""-.
+  /       \      Mochi · Kid · 2d 4h old
+ |  ^   ^  |     Food   ███████░░░
+ | .  w  . |     Fun    █████████░
+  \       /      mood   happy
+   '-...-'
+    ^   ^
+```
+
+Something fun while your builds run: a tiny pet that lives in your terminal.
+It hatches from an egg, grows up over a week, and gets hungry, sleepy, and
+messy in real time, even while it's closed. Feed it, clean up after it, and
+play five minigames (Snack Rain, Hop!, Echo, …) to earn coins for treats. It
+can sit in your shell prompt too: `termigatchi status` prints
+`(^w^) Mochi ♥♥♥♥♡`.
+
+```sh
+brew install maytech-labs/tap/termigatchi   # or, from this repo:
+cargo run --release -p termigatchi
+```
+
+How to care for it, the games, and prompt setup: [termigatchi's README](crates/termigatchi/README.md).
 
 [clap]: https://docs.rs/clap
