@@ -1,0 +1,19 @@
+[package]
+name = "termigatchi"
+version = "0.1.0"
+description = "A tiny, always-alive pet that lives in your terminal"
+homepage = "https://github.com/maytech-labs/godo/tree/main/crates/termigatchi"
+readme = "README.md"
+keywords = ["tamagotchi", "pet", "game", "tui", "terminal"]
+categories = ["games", "command-line-utilities"]
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+rand = "0.9.5"
+ratatui = "0.30.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"

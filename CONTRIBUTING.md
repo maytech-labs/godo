@@ -6,8 +6,9 @@
 |---|---|---|---|
 | clapsmith | `crates/clapsmith`, `crates/clapsmith-derive` | `cargo test -p clapsmith` | `crate:clapsmith` |
 | godo | `crates/godo` | `cargo run -p godo-cli -- --help` | `crate:godo` |
+| termigatchi | `crates/termigatchi` | `cargo run -p termigatchi` | `crate:termigatchi` |
 
-clapsmith never depends on godo, so it builds and tests on its own.
+clapsmith never depends on godo, so it builds and tests on its own. termigatchi depends on neither.
 
 ## godo builds itself
 
@@ -40,5 +41,15 @@ Contributions are under the [REAL 1.0](LICENSE.md) licence, the same as the proj
    ```
 
 The workflow sets `crates/godo`'s version, dates the changelog, and commits that to main. It then builds macOS and Linux (arm and intel) binaries, publishes a GitHub release, and bumps `Formula/godo.rb` in [maytech-labs/homebrew-tap](https://github.com/maytech-labs/homebrew-tap). The last step needs the `HOMEBREW_TAP_TOKEN` secret: a fine-grained token with contents write on the tap only.
+
+## Releasing termigatchi
+
+Same as godo, with its own tags and workflow (**Release termigatchi**):
+
+```sh
+git tag termigatchi-v0.1.0 && git push origin termigatchi-v0.1.0
+```
+
+It bumps `Formula/termigatchi.rb` in the tap, which must exist first: copy `crates/termigatchi/packaging/termigatchi.rb` there for the first release.
 
 clapsmith releases separately (to crates.io) with `clapsmith-v*` tags. That isn't automated yet.
